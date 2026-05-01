@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: alb-demo                       # holds the ApplicationLoadBalancer CR (managed-by-ALB)
+  labels: { kubernetes.io/metadata.name: alb-demo }
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agc-sites                      # holds the demo workloads, Gateway, HTTPRoutes
+  labels: { kubernetes.io/metadata.name: agc-sites }

@@ -1,0 +1,46 @@
+# One Gateway (= one AGC frontend) hosting three sites via HTTPRoutes.
+# AGC names the frontend "fe-<random>" automatically when ALB-managed.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gateway-01
+  namespace: agc-sites
+  annotations:
+    alb.networking.azure.io/alb-namespace: alb-demo
+    alb.networking.azure.io/alb-name: alb-demo
+spec:
+  gatewayClassName: azure-alb-external
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: contoso-route, namespace: agc-sites }
+spec:
+  parentRefs: [{ name: gateway-01 }]
+  hostnames: ["contoso.example.com"]
+  rules:
+  - backendRefs: [{ name: contoso, port: 8080 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: fabrikam-route, namespace: agc-sites }
+spec:
+  parentRefs: [{ name: gateway-01 }]
+  hostnames: ["fabrikam.example.com"]
+  rules:
+  - backendRefs: [{ name: fabrikam, port: 8080 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: adventure-route, namespace: agc-sites }
+spec:
+  parentRefs: [{ name: gateway-01 }]
+  hostnames: ["adventure.example.com"]
+  rules:
+  - backendRefs: [{ name: adventure, port: 8080 }]

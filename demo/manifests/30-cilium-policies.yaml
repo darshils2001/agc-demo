@@ -1,0 +1,100 @@
+# =============================================================================
+# Cilium L7 + default-deny network policies for the agc-sites namespace.
+#
+# Goals (translated from the customer's brief):
+#   * Inbound: DENY by default. Only allow HTTP GET on port 8080 to the three
+#     site pods (contoso/fabrikam/adventure). POST/PUT/DELETE/etc. are blocked
+#     by the L7 proxy => returns 403 Access Denied.
+#   * Outbound: DENY by default. Only allow DNS to kube-dns. Everything else
+#     (Internet, ARM, IMDS, other namespaces) is blocked.
+#   * The ALB Controller / AGC controller pods live in kube-system and are
+#     intentionally NOT covered by these policies, so the AGC data path keeps
+#     working while the workloads stay locked down.
+# =============================================================================
+
+# ----- 1. Default-deny ingress + egress for everything in agc-sites ----------
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: agc-sites
+spec:
+  description: "Default deny all ingress and egress for every pod in agc-sites"
+  endpointSelector: {}            # match all pods in this namespace
+  ingress:
+  - {}                            # empty rule list with policyTypes implied -> deny
+  egress:
+  - {}
+---
+# ----- 2. Allow DNS egress (everyone in the namespace needs DNS) -------------
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: agc-sites
+spec:
+  description: "Allow UDP/TCP 53 to kube-dns for name resolution"
+  endpointSelector: {}
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        k8s:io.kubernetes.pod.namespace: kube-system
+        k8s-app: kube-dns
+    toPorts:
+    - ports:
+      - { port: "53", protocol: UDP }
+      - { port: "53", protocol: TCP }
+      rules:
+        dns:
+        - matchPattern: "*"       # L7 DNS visibility for Hubble
+---
+# ----- 3. L7 ingress: allow only HTTP GET on / to the three site pods --------
+# AGC delivers traffic directly to pod IPs; the source from Cilium's view is
+# `world` (out-of-cluster IPs from the AGC data plane subnet). We allow that
+# entity but restrict to L7 GET only -- POST/PUT/etc. -> 403 Access Denied.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-agc-l7-get-only
+  namespace: agc-sites
+spec:
+  description: "AGC frontend may only issue HTTP GET to / on site pods"
+  endpointSelector:
+    matchExpressions:
+    - { key: site, operator: In, values: [contoso, fabrikam, adventure] }
+  ingress:
+  - fromEntities:
+    - world                       # AGC data-plane traffic appears as world
+    - cluster                     # also allow east-west from client pod
+    toPorts:
+    - ports:
+      - { port: "8080", protocol: TCP }
+      rules:
+        http:
+        - method: "GET"
+          path: "/"
+        - method: "GET"
+          path: "/products"       # extra path for the east-west demo
+---
+# ----- 4. East-west: client pod may call ONLY contoso (L7 GET) ---------------
+# Demonstrates pod-to-pod L7 enforcement. Curling fabrikam/adventure from the
+# client pod is blocked at L4 (no rule matches), curling POST to contoso is
+# blocked at L7 (returns 403).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: client-may-call-contoso-get-only
+  namespace: agc-sites
+spec:
+  description: "client -> contoso, GET only. fabrikam/adventure unreachable from client."
+  endpointSelector:
+    matchLabels: { app: client }
+  egress:
+  - toEndpoints:
+    - matchLabels: { app: contoso }
+    toPorts:
+    - ports: [{ port: "8080", protocol: TCP }]
+      rules:
+        http:
+        - method: "GET"
+          path: "/"

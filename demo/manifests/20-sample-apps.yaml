@@ -1,0 +1,138 @@
+# Three lightweight sample sites: contoso, fabrikam, adventureworks.
+# Each is a tiny nginx serving a unique HTML page on port 8080.
+# Used to demonstrate AGC multi-site hosting via Gateway API HTTPRoutes.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: contoso-html
+  namespace: agc-sites
+data:
+  index.html: |
+    <html><body><h1>Hello from Contoso</h1><p>Served from contoso.example backend</p></body></html>
+  default.conf: |
+    server { listen 8080; location / { root /usr/share/nginx/html; index index.html; } }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fabrikam-html
+  namespace: agc-sites
+data:
+  index.html: |
+    <html><body><h1>Hello from Fabrikam</h1><p>Served from fabrikam.example backend</p></body></html>
+  default.conf: |
+    server { listen 8080; location / { root /usr/share/nginx/html; index index.html; } }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adventure-html
+  namespace: agc-sites
+data:
+  index.html: |
+    <html><body><h1>Hello from Adventure Works</h1><p>Served from adventure.example backend</p></body></html>
+  default.conf: |
+    server { listen 8080; location / { root /usr/share/nginx/html; index index.html; } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: contoso, namespace: agc-sites, labels: { app: contoso, site: contoso } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: contoso } }
+  template:
+    metadata: { labels: { app: contoso, site: contoso } }
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.27-alpine
+        ports: [{ containerPort: 8080 }]
+        volumeMounts:
+        - { name: html, mountPath: /usr/share/nginx/html }
+        - { name: conf, mountPath: /etc/nginx/conf.d }
+      volumes:
+      - name: html
+        configMap: { name: contoso-html, items: [{ key: index.html, path: index.html }] }
+      - name: conf
+        configMap: { name: contoso-html, items: [{ key: default.conf, path: default.conf }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: contoso, namespace: agc-sites }
+spec:
+  selector: { app: contoso }
+  ports: [{ port: 8080, targetPort: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: fabrikam, namespace: agc-sites, labels: { app: fabrikam, site: fabrikam } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: fabrikam } }
+  template:
+    metadata: { labels: { app: fabrikam, site: fabrikam } }
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.27-alpine
+        ports: [{ containerPort: 8080 }]
+        volumeMounts:
+        - { name: html, mountPath: /usr/share/nginx/html }
+        - { name: conf, mountPath: /etc/nginx/conf.d }
+      volumes:
+      - name: html
+        configMap: { name: fabrikam-html, items: [{ key: index.html, path: index.html }] }
+      - name: conf
+        configMap: { name: fabrikam-html, items: [{ key: default.conf, path: default.conf }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: fabrikam, namespace: agc-sites }
+spec:
+  selector: { app: fabrikam }
+  ports: [{ port: 8080, targetPort: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: adventure, namespace: agc-sites, labels: { app: adventure, site: adventure } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: adventure } }
+  template:
+    metadata: { labels: { app: adventure, site: adventure } }
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.27-alpine
+        ports: [{ containerPort: 8080 }]
+        volumeMounts:
+        - { name: html, mountPath: /usr/share/nginx/html }
+        - { name: conf, mountPath: /etc/nginx/conf.d }
+      volumes:
+      - name: html
+        configMap: { name: adventure-html, items: [{ key: index.html, path: index.html }] }
+      - name: conf
+        configMap: { name: adventure-html, items: [{ key: default.conf, path: default.conf }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: adventure, namespace: agc-sites }
+spec:
+  selector: { app: adventure }
+  ports: [{ port: 8080, targetPort: 8080 }]
+---
+# An in-cluster client used to demonstrate east-west L7 enforcement.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: client, namespace: agc-sites, labels: { app: client, role: client } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: client } }
+  template:
+    metadata: { labels: { app: client, role: client } }
+    spec:
+      containers:
+      - name: curl
+        image: curlimages/curl:8.10.1
+        command: ["sleep", "infinity"]

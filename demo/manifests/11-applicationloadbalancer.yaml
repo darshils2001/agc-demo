@@ -1,0 +1,10 @@
+# Tells the ALB Controller add-on to provision an Application Gateway for
+# Containers resource (the "ALB managed" deployment strategy).
+apiVersion: alb.networking.azure.io/v1
+kind: ApplicationLoadBalancer
+metadata:
+  name: alb-demo
+  namespace: alb-demo
+spec:
+  associations:
+  - "/subscriptions/64d48c73-c5f4-4817-93d8-65908359d9b4/resourceGroups/rg-agc-cilium-demo/providers/Microsoft.Network/virtualNetworks/PLACEHOLDER/subnets/aks-appgateway"
