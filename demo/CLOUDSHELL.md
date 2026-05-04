@@ -432,7 +432,7 @@ All 4 should show `VALID=True`.
 
 ## 4. Test it
 
-**This is the demo.** Each subsection proves one of the four-step requirements is enforced. Read the expected output aloud before running so the audience knows what to watch for.
+**This is the demo.** Each subsection proves one of the four-step requirements is enforced. Read the "Expected output" block aloud *before* running so the audience knows what to watch for, then read the "What it proves" block *after*.
 
 First grab the AGC FQDN and resolve it once — every test below pins to this IP via `curl --resolve`, since we don't own `*.example.com`:
 
@@ -441,6 +441,18 @@ FQDN=$(kubectl get gateway gateway-01 -n $APP_NAMESPACE -o jsonpath='{.status.ad
 IP=$(getent hosts "$FQDN" | awk '{print $1}' | head -1)
 echo "$FQDN -> $IP"
 ```
+
+**Expected output** (FQDN and IP will differ each run):
+
+```text
+dae7c5atdqguhwa0.fz13.alb.azure.com -> 20.238.208.7
+```
+
+**What it proves:**
+
+- `FQDN` populated → AGC frontend has been provisioned and the ALB Controller has written it back into `Gateway.status.addresses[]`.
+- `IP` populated → public DNS already resolves the AGC hostname (Azure publishes it the moment AGC is ready).
+- `20.x` is a Microsoft-owned range. Always use the FQDN in real configs — the IP is Azure-managed and can change.
 
 ### 4a. Multi-site routing
 
@@ -454,14 +466,29 @@ for h in contoso fabrikam adventure; do
 done
 ```
 
+**Expected output:**
+
+```text
+[contoso.example.com]
+<html><body><h1>Hello from Contoso</h1><p>Served from contoso.example backend</p></body></html>
+
+[fabrikam.example.com]
+<html><body><h1>Hello from Fabrikam</h1><p>Served from fabrikam.example backend</p></body></html>
+
+[adventure.example.com]
+<html><body><h1>Hello from Adventure Works</h1><p>Served from adventure.example backend</p></body></html>
+```
+
+**What it proves:**
+
+- **One AGC frontend, one public IP, three tenants.** All three requests hit the same `$IP`; the only difference is the `Host:` header set by `curl --resolve`.
+- **Gateway API multi-site is real.** Each `HTTPRoute` matched its hostname and routed to the right Service. Adding a fourth site is one more `HTTPRoute`, no Azure-side change.
+- **The L7 allow rule lets `GET /` through.** This is the happy path — the thing customers actually want their users to do.
+- **This is the AGC headline shot.** *One FQDN, three independent websites, zero infrastructure reconfiguration.*
+
 ### 4b. Cilium L7 (GET allowed, POST denied)
 
-**Proves step 1 (L7 policy) AND the inbound half of step 4.** Talking points:
-
-- `GET / -> 200`: allowed by `allow-agc-l7-get-only`, served by nginx.
-- `POST/PUT/DELETE / -> 403`: **Cilium denies these before nginx is reached.** A vanilla L4 policy could not do this — port 80 is the same for all four methods.
-- `GET /products -> 404`: Cilium *permits* the path (it's in the allow list), so the request reaches nginx; nginx has no `/products` file, so nginx returns 404. **The 404 vs 403 distinction is the punch line: you can tell the difference between "Cilium dropped you" and "the app dropped you."**
-- `GET /admin -> 403`: Cilium denies — `/admin` is not in the allow list. The app never sees this request.
+**Proves step 1 (L7 policy) AND the inbound half of step 4.** This is the punch line of the entire demo — the difference between L4 ("port 80 is allowed") and L7 ("GET on port 80 is allowed, POST is not").
 
 ```bash
 for m in GET POST PUT DELETE; do
@@ -474,15 +501,34 @@ for p in / /products /admin; do
 done
 ```
 
-Expect `GET=200`, others `=403`. `GET /products=404` (Cilium passes; nginx 404). `GET /admin=403` is **Cilium**.
+**Expected output:**
+
+```text
+GET / -> 200
+POST / -> 403
+PUT / -> 403
+DELETE / -> 403
+GET / -> 200
+GET /products -> 404
+GET /admin -> 403
+```
+
+**What it proves, line by line:**
+
+| Line | What happened | Why |
+|---|---|---|
+| `GET / -> 200` | AGC routed → Cilium L7 proxy matched `GET /` rule → forwarded to nginx → 200 | The whitelisted method/path. The happy path. |
+| `POST / -> 403` | AGC happily forwarded → **Cilium L7 proxy rejected** before nginx | Same port, same path, different verb. **A vanilla L4 NetworkPolicy could not block this.** |
+| `PUT / -> 403` | Same as POST | Default-deny on methods. Only GET is whitelisted. |
+| `DELETE / -> 403` | Same as POST | Same. |
+| `GET /products -> 404` | Cilium **passed the request** (allowed by `GET /products` rule) → nginx had no such file → returned 404 | **THE KEY MOMENT.** 404 (not 403) means the request reached the app. Proves Cilium is actually doing L7 inspection, not blanket-blocking. |
+| `GET /admin -> 403` | Cilium dropped (path not whitelisted); nginx never saw the request | The bouncer at the door rejected it. nginx never knew it was coming. |
+
+**The 404-vs-403 distinction is the single most important slide of the talk.** Anyone can build "deny everything." Proving you can build "deny-all-except-this-method-on-this-path-and-pass-everything-else-untouched" is the AGC + ACNS L7 differentiator vs. classic ingress + L4 NetworkPolicy.
 
 ### 4c. East-west L7
 
-**This is the "get creative" bonus.** Same Cilium L7 enforcement, but now the source isn't AGC — it's another pod inside the cluster. Talking points:
-
-- `client -> contoso GET -> 200`: both policies (allow-agc-l7-get-only on contoso side, client-may-call-contoso-get-only on client side) permit it.
-- `client -> contoso POST -> 403`: Cilium L7 deny. Even though the *destination* is the same Service, the method is wrong. **A pod compromised inside your own cluster cannot call dangerous methods on neighbors it would otherwise be allowed to talk to.**
-- `client -> fabrikam -> 000` (timeout): no policy whitelists this pair, so default-deny drops the SYN packet. The `000` is curl reporting "never got a response." That's L4 enforcement on top of L7.
+**This is the "get creative" bonus.** Same Cilium L7 enforcement, but now the source isn't AGC — it's another pod inside the cluster. The same rules apply.
 
 ```bash
 CLIENT=$(kubectl get pod -n $APP_NAMESPACE -l app=client -o jsonpath='{.items[0].metadata.name}')
@@ -492,13 +538,29 @@ kubectl exec -n $APP_NAMESPACE $CLIENT -- curl -s -o /dev/null -w "client->conto
 kubectl exec -n $APP_NAMESPACE $CLIENT -- curl -s --ipv4 -o /dev/null -w "client->fabrikam     -> %{http_code}\n" --max-time 5 http://fabrikam:8080/
 ```
 
-Expect `200 / 403 / 000`.
+**Expected output:**
+
+```text
+client->contoso GET  -> 200
+client->contoso POST -> 403
+client->fabrikam     -> 000
+```
+
+**What it proves:**
+
+| Line | What happened | Why |
+|---|---|---|
+| `client->contoso GET -> 200` | Both `client-may-call-contoso-get-only` and `allow-agc-l7-get-only` permit GET → request reached nginx | **Both ends must agree.** Egress policy on client + ingress policy on contoso both whitelist this exact call. |
+| `client->contoso POST -> 403` | Cilium L7 proxy parsed the HTTP, saw POST, returned 403 | Right pod, right port, **wrong method.** A compromised neighbor cannot call dangerous methods even on services it would otherwise reach. |
+| `client->fabrikam -> 000` | TCP handshake never completed — Cilium silently dropped the SYN | **No policy whitelists `client → fabrikam`.** Default-deny kicks in at L3/L4, before HTTP exists. curl reports `000` for "never got a response." |
+
+**Talking point:** *"403 vs 000 is itself a signal. 403 means Cilium spoke HTTP back to us — it accepted the connection, parsed the request, then rejected at L7. 000 means Cilium never even let the TCP handshake complete. Different layer, same result: denied. Customers can use this distinction in their alerting to tell the difference between a misbehaving app (403) and a totally unknown peer (000)."*
 
 ### 4d. Default-deny egress
 
-**Proves the outbound half of step 4.** A backend pod tries to reach the public internet (`bing.com`). It can't — `default-deny-all` drops outbound traffic, and we never wrote an allow rule for the internet. `wget` exits non-zero (rc=1 for unreachable, rc=143 if the kill-after timeout fired). **If a workload were exfiltrating data, this is what stops it.**
+**Proves the outbound half of step 4.** A backend pod tries to reach the public internet (`bing.com`). It can't — `default-deny-all` drops outbound traffic, and we never wrote an allow rule for the internet.
 
-The ask said "For outbound, you could allow the controller endpoints and block everything else" — that's exactly this pattern. We allow DNS in `allow-dns-egress` and nothing else. To allow specific FQDNs (e.g., a vendor API), you'd add another CNP with `toFQDNs: [matchName: "api.vendor.com"]`.
+The ask said *"For outbound, you could allow the controller endpoints and block everything else"* — that's exactly this pattern. We allow DNS in `allow-dns-egress` and nothing else. To allow specific FQDNs (e.g., a vendor API), you'd add another CNP with `toFQDNs: [matchName: "api.vendor.com"]`.
 
 ```bash
 CONTOSO=$(kubectl get pod -n $APP_NAMESPACE -l app=contoso -o jsonpath='{.items[0].metadata.name}')
@@ -506,13 +568,48 @@ kubectl exec -n $APP_NAMESPACE $CONTOSO -- wget -q -T 5 -O /dev/null https://www
 echo "rc=$?  (non-zero = blocked)"
 ```
 
+**Expected output:**
+
+```text
+wget: download timed out
+command terminated with exit code 1
+rc=1  (non-zero = blocked)
+```
+
+**What it proves:**
+
+- **DNS still resolves.** `getaddrinfo("www.bing.com")` succeeds — kube-dns is reached via `allow-dns-egress`, returns a real public IP. So this isn't "the cluster is broken."
+- **The TCP connection to that IP silently times out.** Cilium drops the SYN at the kernel level — no RST, no ICMP unreachable, no useful error. After 5s, wget gives up. This is Cilium's documented default-deny behavior ([silent drop](https://docs.cilium.io/en/latest/security/policy/intro/#policy-deny-response-handling)).
+- **`rc=1`** confirms the application would see this as a failure. **If a workload were exfiltrating data, this is what stops it.** The attacker doesn't even get a useful error code to retry against.
+
+**Talking point:** *"DNS works because we explicitly allowed it. The TCP connection to bing's actual IP just hangs forever. There's no listener missing, there's no firewall returning 'connection refused' — Cilium silently absorbs the packet at the eBPF datapath. From the attacker's perspective, the network is a black hole."*
+
 ### 4e. DNS still works
 
-**Proves the carve-out is correctly scoped.** Even with default-deny in place, kube-dns is reachable because `allow-dns-egress` whitelists port 53 to the kube-dns endpoints. The `nslookup` returns an `Address:` line for the contoso ClusterIP — not NXDOMAIN, not a timeout. **This is the litmus test that you blocked the right things and not too much.**
+**Proves the carve-out is correctly scoped.** Even with default-deny in place, kube-dns is reachable because `allow-dns-egress` whitelists port 53 to the kube-dns endpoints with the L7 DNS rule `matchPattern: "*"` (any name allowed). **This is the litmus test that you blocked the right things and not too much.**
 
 ```bash
 kubectl exec -n $APP_NAMESPACE $CLIENT -- nslookup contoso.agc-sites.svc.cluster.local
 ```
+
+**Expected output:**
+
+```text
+Server:         10.0.0.10
+Address:        10.0.0.10:53
+
+
+Name:   contoso.agc-sites.svc.cluster.local
+Address: 10.0.37.14
+```
+
+**What it proves:**
+
+- **`Server: 10.0.0.10:53`** — that's the kube-dns ClusterIP. The client pod successfully reached it on port 53. Egress to *that* destination, on *that* port, with the *DNS protocol*, was permitted by `allow-dns-egress`.
+- **`Address: 10.0.37.14`** — the resolved Service IP for contoso. A real DNS answer, not a timeout, not NXDOMAIN.
+- **Compare with 4d.** Same pod resolved `www.bing.com` (DNS allowed) but couldn't connect to it (TCP denied). DNS is uniformly allowed (by name pattern `*`), but **TCP/UDP to anywhere except kube-dns:53** is dropped. That's the precision the ask demanded.
+
+**Talking point:** *"We didn't break workloads' ability to discover services. We only blocked the actual data path. That's the difference between 'lock it all down and break the app' and 'lock it all down and the app keeps working for the things you allowed.' And if a customer wants per-name DNS allowlisting — `matchPattern: '*.contoso.com'` instead of `*` — that's one YAML line away."*
 
 ---
 
@@ -532,7 +629,19 @@ In another tab, send a denied request:
 curl -X POST --resolve contoso.example.com:80:$IP http://contoso.example.com/
 ```
 
-Watch the `DROPPED` event scroll by with method `POST`.
+**Expected output in the monitor tab** (one or more lines like):
+
+```text
+xx drop (Policy denied) flow 0x... to endpoint NNNN, ifindex N, file bpf_lxc.c:..., , identity world->NNNNN: <client-IP>:port -> <pod-IP>:8080 tcp ACK, FIN
+```
+
+You'll also see the L7 verdict if the request made it past L4 — `Verdict=DENIED` with method `POST` and path `/`.
+
+**What it proves:**
+
+- The drop is happening on the **data plane** (`bpf_lxc.c` is the eBPF program in the kernel), not in some userspace controller polling logs after the fact.
+- The reason is `Policy denied` — the network-policy engine made the decision. Not a firewall, not nginx, not the kube-proxy.
+- It's immediate (sub-millisecond) and observable (every drop emits an event). For Hubble, this same stream populates the UI graph.
 
 ---
 
