@@ -4,6 +4,21 @@ Companion to [CLOUDSHELL.md](CLOUDSHELL.md). Read this *before* and *after* the 
 
 ---
 
+## The one-line framing (memorize this)
+
+> **AGC brings traffic *into* the cluster. ACNS controls how traffic flows *within* the cluster.**
+
+Two features, two jobs, one coherent zero-trust story:
+
+| Layer | Product | Direction | What it owns |
+|---|---|---|---|
+| **North-south** (internet ↔ cluster) | **AGC** (Application Gateway for Containers) | Outside → in | Public FQDN, TLS, multi-site routing, the Azure-managed L7 front door |
+| **East-west** (pod ↔ pod) | **ACNS L7** (Cilium dataplane) | Inside ↔ inside | Pod-level identity, default-deny, HTTP method/path enforcement, egress control |
+
+The demo runs the same `POST /` request through both layers and shows you can independently enforce at each one. **AGC and ACNS are not alternatives — they're complements.** A customer using AGC alone has a great front door but a wide-open interior. A customer using ACNS alone has a hardened interior but no managed ingress. Together they cover the whole traffic graph.
+
+---
+
 ## Why this demo exists
 
 This demo is owned by the **Application Gateway team**. It exists to show **what AGC unlocks for AKS customers** when you adopt it as the cluster's L7 ingress, end-to-end:

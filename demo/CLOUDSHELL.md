@@ -2,6 +2,8 @@
 
 Hands-on-keyboard runbook. Paste each block into **Azure Cloud Shell** (<https://shell.azure.com> or the `>_` icon in the portal — `az`, `kubectl`, `curl` are pre-installed). Zero git, every manifest inline.
 
+> **The framing in one line:** **AGC brings traffic *into* the cluster. ACNS L7 controls how traffic flows *within* the cluster.** Two features, two directions, one zero-trust story. Step 4 demonstrates each layer independently.
+
 > **Read [PITCH.md](PITCH.md) first** for the *why* (problem statement, what AGC unlocks, what this demo proves) and *afterwards* for the wrap-up, Q&A talking points, and next steps. This file is just the steps.
 
 ---
@@ -434,6 +436,19 @@ All 4 should show `VALID=True`.
 
 **This is the demo.** Each subsection proves one of the four-step requirements is enforced. Read the "Expected output" block aloud *before* running so the audience knows what to watch for, then read the "What it proves" block *after*.
 
+**Mental model for the next ten tests** — keep this on screen the whole time:
+
+| Tests | Layer being demonstrated | What's enforcing | Direction |
+|---|---|---|---|
+| **4a** Multi-site routing | **AGC** (the front door) | Gateway API `HTTPRoute` hostname matching on the AGC frontend | North-south: internet → cluster |
+| **4b** GET vs POST/PUT/DELETE, /products vs /admin | **ACNS L7** (the bouncer at the pod door) | `CiliumNetworkPolicy` L7 rules at the contoso/fabrikam/adventure pod | North-south *behind* AGC: AGC → pod |
+| **4c** client → contoso GET/POST, client → fabrikam | **ACNS L7** (east-west, no AGC involved) | Same `CiliumNetworkPolicy` L7 rules, applied to in-cluster pod-to-pod | **East-west: pod ↔ pod** |
+| **4d** Backend pod → bing.com | **ACNS** default-deny egress | `default-deny-all` CNP at the pod | East-west out: pod → internet |
+| **4e** DNS still resolves | **ACNS** carve-out | `allow-dns-egress` CNP | East-west to kube-dns |
+| **5** Live drop monitor | **ACNS** observability | `cilium monitor` reading kernel events | Whichever direction you generate traffic in |
+
+> **One sentence to repeat at the start of step 4:** *"AGC is what brought the request into the cluster — you'll see that work in 4a. From 4b onward, ACNS L7 controls what happens to that request once it's inside the cluster: north-south *behind* AGC (4b), pod-to-pod east-west (4c), and outbound (4d/4e)."*
+
 First grab the AGC FQDN and resolve it once — every test below pins to this IP via `curl --resolve`, since we don't own `*.example.com`:
 
 ```bash
@@ -456,7 +471,9 @@ dae7c5atdqguhwa0.fz13.alb.azure.com -> 20.238.208.7
 
 ### 4a. Multi-site routing
 
-**Proves step 3 of the ask.** One frontend FQDN, three different responses based on the Host header. The `<h1>Hello from <site></h1>` line shows which backend pod actually served the request — so you know AGC routed by hostname, didn't just default-backend everything.
+**Proves step 3 of the ask. This is the AGC half — traffic *into* the cluster.** One frontend FQDN, three different responses based on the Host header. The `<h1>Hello from <site></h1>` line shows which backend pod actually served the request — so you know AGC routed by hostname, didn't just default-backend everything.
+
+**The AGC framing for this test:** *"Everything happening in 4a is AGC's job. AGC is the only Azure resource a packet from the internet touches before it lands on a pod. North-south traffic is its world. Notice: one public IP, three tenants, routed purely by Host header — that's Gateway API multi-site working as designed."*
 
 ```bash
 for h in contoso fabrikam adventure; do
@@ -488,7 +505,9 @@ done
 
 ### 4b. Cilium L7 (GET allowed, POST denied)
 
-**Proves step 1 (L7 policy) AND the inbound half of step 4.** This is the punch line of the entire demo — the difference between L4 ("port 80 is allowed") and L7 ("GET on port 80 is allowed, POST is not").
+**Proves step 1 (L7 policy) AND the inbound half of step 4. The story shifts here: AGC got us *into* the cluster, ACNS now controls what happens *within* it.** This is the punch line of the entire demo — the difference between L4 ("port 80 is allowed") and L7 ("GET on port 80 is allowed, POST is not").
+
+**Hand-off line from 4a to 4b:** *"AGC just forwarded every one of those requests, no questions asked — that's its job. Watch what the bouncer at the pod door (ACNS L7) does to the bad ones. Same destination, same port, but the verb and path now matter."*
 
 ```bash
 for m in GET POST PUT DELETE; do
@@ -528,7 +547,9 @@ GET /admin -> 403
 
 ### 4c. East-west L7
 
-**This is the "get creative" bonus.** Same Cilium L7 enforcement, but now the source isn't AGC — it's another pod inside the cluster. The same rules apply.
+**This is the "get creative" bonus — and it's the *east-west* half of the framing.** Same Cilium L7 enforcement as 4b, but the source isn't AGC anymore. **There is no AGC in this picture at all.** One pod inside the cluster (`client`) is talking directly to another pod (`contoso`, `fabrikam`) over the cluster's internal network. ACNS L7 is enforcing on a path AGC never sees.
+
+**The ACNS framing for this test:** *"AGC controls the front door of the building. ACNS controls every interior door. Even if a pod is already inside the cluster — even if it's been compromised and is now the *source* of malicious traffic — ACNS still enforces the same method-and-path rules. There is no 'trusted east-west' in a zero-trust posture, and ACNS is what makes that real. This is the half of the traffic graph AGC was never designed to touch."*
 
 ```bash
 CLIENT=$(kubectl get pod -n $APP_NAMESPACE -l app=client -o jsonpath='{.items[0].metadata.name}')
