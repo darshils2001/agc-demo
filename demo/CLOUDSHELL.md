@@ -11,9 +11,9 @@ Hands-on-keyboard runbook. Paste each block into **Azure Cloud Shell** (<https:/
 ## 0. Set variables and pick your subscription
 
 **Talking points:**
-- We're targeting the `rnautiyal@lab` subscription and a fresh resource group dated `5-4`.
-- Region is **westus3**. AGC is multi-region; during build `eastus2` returned `Microsoft.ServiceNetworking InternalServerError` on subnet association (a transient regional issue), so we switched. **Worth flagging:** the AGC controller surfaces this clearly in `az network alb association list` — customers don't have to guess.
-- Two namespaces: `alb-demo` holds the AGC `ApplicationLoadBalancer` CR (the AGC frontend's intent lives here), `agc-sites` holds the workloads + Cilium policies. This split mirrors the ownership boundary we recommend in AGC docs — platform team owns `alb-demo`, app team owns `agc-sites`.
+- Set these to whatever subscription / region / resource group / cluster name you're using. The values below are placeholders — swap them for your own. The rest of the runbook references these variables, so you only edit them once here.
+- Pick a region where AGC is generally available and your subscription has capacity for a small AKS cluster. AGC is multi-region; if a particular region returns transient `Microsoft.ServiceNetworking` errors during AGC subnet association, switch regions and retry. The AGC controller will surface these errors clearly in `az network alb association list`.
+- Two namespaces: `$ALB_NAMESPACE` holds the AGC `ApplicationLoadBalancer` CR (the AGC frontend's intent lives here), `$APP_NAMESPACE` holds the workloads + Cilium policies. This split mirrors the ownership boundary we recommend in AGC docs — platform team owns the ALB namespace, app team owns the workload namespace.
 
 
 ```bash
@@ -96,7 +96,21 @@ You should see 2 Ready nodes, 2 Running `alb-controller` pods, and `azure-alb-ex
 
 ## 3. Deploy everything (manifests inline)
 
+**What this whole section is doing.** Step 2 created an empty cluster with the AGC add-on installed but no traffic to handle. Step 3 *fills the cluster*: namespaces, the AGC frontend itself, the three sample apps, the routing rules that put those apps behind AGC, and the Cilium policies that lock everything down. After step 3 finishes you have:
+
+- a public AGC frontend with a real Azure-assigned FQDN,
+- three nginx pods serving three different sites,
+- a Gateway + 3 HTTPRoutes wiring those sites to AGC by hostname,
+- four Cilium policies enforcing default-deny + GET-only at every pod boundary,
+- a `client` pod inside the cluster used to demonstrate east-west enforcement in step 4.
+
 Four sub-steps. Each one introduces a new layer of the architecture; you can pause after each to show the cluster state.
+
+- **3a Namespaces** — just two empty namespaces. Boring but they're the ownership boundary.
+- **3b ApplicationLoadBalancer CR** — *this is what makes Azure provision the AGC frontend*. After 3b runs, you have a real public Azure resource with a real FQDN.
+- **3c Sample apps + client pod** — the three nginx "tenants" plus a curl pod for east-west tests.
+- **3d Gateway + HTTPRoutes** — the Gateway API objects that AGC translates into actual routing config ("send `contoso.example.com` to the contoso pod, etc.").
+- **3e Cilium policies** — the four `CiliumNetworkPolicy` objects that switch every pod into default-deny and then carve out the specific HTTP methods/paths we want to allow.
 
 ### 3a. Namespaces
 
@@ -116,16 +130,21 @@ EOF
 
 ### 3b. Tell AGC to provision a managed frontend (~5 min)
 
-**This is the heart of step 2 of the ask.** Talking points:
+**This is the heart of step 2 of the ask — and this is where AGC actually comes into existence as an Azure resource.** Up until now, the AGC *add-on* was installed (the `alb-controller` pods are running), but no AGC frontend, no public IP, no subnet, nothing in the portal yet. Applying this one tiny YAML changes that.
 
-- `ApplicationLoadBalancer` is a CRD owned by the AGC controller. The shape `spec.associations: []` (an *empty list*) is the magic incantation for **managed-by-ALB** mode — it tells AKS "please create the Azure AGC resource AND the delegated subnet for me."
-- Behind the scenes, AKS:
+Talking points:
+
+- `ApplicationLoadBalancer` is a CRD owned by the AGC controller. Applying this CR is the customer's *declaration of intent*: "I want an AGC frontend." The controller watches for this object and reacts.
+- The shape `spec.associations: []` (an *empty list*) is the magic incantation for **managed-by-ALB** mode. Empty list = "I don't want to bring my own subnet — AKS, please create everything for me." If a customer wanted to pre-create the subnet (BYO mode), they'd populate this list with a subnet reference. Empty list is what most customers want.
+- The instant this CR is applied, AKS does **all** of the following on the customer's behalf, with **zero further input**:
   1. carves a `/24` out of the cluster VNet called `aks-appgateway`,
-  2. delegates it to `Microsoft.ServiceNetworking/TrafficController`,
-  3. creates the AGC resource `alb-<hash>` in the `MC_` resource group,
-  4. associates the subnet to the AGC.
-- The `kubectl wait ... condition=Deployment=True` is how we know all four steps above are done. If it sits at `Updating` for >10 min, that's the AGC regional backend issue we hit in `eastus2` — the fix is to switch regions.
-- Once `Deployment=True`, the AGC has a public frontend FQDN reserved, but no listeners yet. Listeners come from the `Gateway` we apply in 3d.
+  2. delegates that subnet to `Microsoft.ServiceNetworking/TrafficController`,
+  3. provisions the **Application Gateway for Containers** Azure resource (`alb-<hash>`) in the `MC_` resource group,
+  4. associates the new subnet to the new AGC,
+  5. federates the AGC's workload identity with the cluster's OIDC issuer so the controller can call ARM to keep this AGC in sync.
+- This is what "managed-by-AKS" means in practice. The customer wrote 7 lines of YAML; AKS produced an Azure load balancer, a delegated subnet, and a workload identity. Compare with classic Application Gateway v1, where the customer would manually provision all three.
+- The `kubectl wait ... condition=Deployment=True` is how we know all five steps above are done. If it sits at `Updating` for >10 min, that's typically a transient AGC regional backend issue — the fix is to switch regions.
+- Once `Deployment=True`, the AGC has a public frontend FQDN reserved, but no listeners yet (no port 80, no port 443). Listeners come from the `Gateway` we apply in 3d. So at the end of 3b you have AGC "powered on but with no doors open"; in 3d we'll open the doors.
 
 ```bash
 kubectl apply -f - <<EOF
@@ -343,19 +362,16 @@ spec:
 EOF
 ```
 
-Wait for the Gateway to get its public FQDN:
-
-```bash
-for i in $(seq 1 30); do
-  fqdn=$(kubectl get gateway gateway-01 -n $APP_NAMESPACE -o jsonpath='{.status.addresses[0].value}')
-  prog=$(kubectl get gateway gateway-01 -n $APP_NAMESPACE -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}')
-  printf "%s prog=%s fqdn=%s\n" "$(date -u +%T)" "${prog:-?}" "${fqdn:-<none>}"
-  [ "$prog" = "True" ] && [ -n "$fqdn" ] && break
-  sleep 30
-done
-```
-
 ### 3e. Cilium L7 policies
+
+**What we're applying here.** Four `CiliumNetworkPolicy` (CNP) objects. CNP is Cilium's superset of Kubernetes `NetworkPolicy` — it speaks not just "allow port X from pod Y" but also "allow HTTP method M on path P" and "allow DNS queries matching pattern Q." That HTTP-aware piece is what ACNS L7 unlocks; vanilla Kubernetes NetworkPolicy can't express it.
+
+**Why we need four of them.** Cilium policies are *additive whitelists* — each policy allows something, and traffic that isn't allowed by any policy gets dropped (once default-deny is engaged). So we layer them:
+
+1. First, switch every pod in `$APP_NAMESPACE` into default-deny (`default-deny-all`). After this policy alone is applied, **nothing works** — not even DNS. That's intentional; we want to start from "deny everything" and explicitly carve out only what's needed.
+2. Then add DNS as the first carve-out (`allow-dns-egress`) so apps can resolve service names.
+3. Then carve out the **north-south path through AGC** with HTTP-method-and-path precision (`allow-agc-l7-get-only`) — this is what makes AGC → pod traffic work, but only for `GET /` and `GET /products`.
+4. Finally carve out a specific **east-west path** (`client-may-call-contoso-get-only`) so the in-cluster `client` pod can call `contoso` — again, only `GET /`. This one is optional for ingress security but lets us demo east-west enforcement in 4c.
 
 **This is step 4 of the ask plus the "get creative" bonus.** Read each policy aloud — they layer:
 
@@ -367,6 +383,8 @@ done
 | 4 | `client-may-call-contoso-get-only` | The east-west bonus. Pod with `app: client` may egress to pod with `app: contoso` on `GET /` only. Critically, both this AND policy 3 must allow the call — they're additive. POST fails because policy 3 denies, and `client → fabrikam` fails entirely because nothing whitelists it (default-deny wins). |
 
 **Why include `cluster` in `fromEntities`** in policy 3: AGC routes traffic through a node-local hop that Cilium identifies as `cluster`, not `world`. If you only allow `world`, the GET sometimes returns 403 even though the L7 rule matches. This caught us during build — listing both is the correct pattern.
+
+**After these four are applied,** the cluster is in the final demo state: AGC traffic for `GET /` and `GET /products` works; everything else is dropped at the pod boundary, observable via `cilium monitor` in step 5.
 
 ```bash
 kubectl apply -f - <<'EOF'
