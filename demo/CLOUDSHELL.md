@@ -489,6 +489,10 @@ dae7c5atdqguhwa0.fz13.alb.azure.com -> 20.238.208.7
 
 ### 4a. Multi-site routing
 
+| Tests | Layer | What's enforcing | Direction |
+|---|---|---|---|
+| **4a** Multi-site routing | **AGC** (the front door) | Gateway API `HTTPRoute` hostname matching on the AGC frontend | North-south: internet → cluster |
+
 **Proves step 3 of the ask. This is the AGC half — traffic *into* the cluster.** One frontend FQDN, three different responses based on the Host header. The `<h1>Hello from <site></h1>` line shows which backend pod actually served the request — so you know AGC routed by hostname, didn't just default-backend everything.
 
 **The AGC framing for this test:** *"Everything happening in 4a is AGC's job. AGC is the only Azure resource a packet from the internet touches before it lands on a pod. North-south traffic is its world. Notice: one public IP, three tenants, routed purely by Host header — that's Gateway API multi-site working as designed."*
@@ -522,6 +526,10 @@ done
 - **This is the AGC headline shot.** *One FQDN, three independent websites, zero infrastructure reconfiguration.*
 
 ### 4b. Cilium L7 (GET allowed, POST denied)
+
+| Tests | Layer | What's enforcing | Direction |
+|---|---|---|---|
+| **4b** GET vs POST/PUT/DELETE, /products vs /admin | **ACNS L7** (the bouncer at the pod door) | `CiliumNetworkPolicy` L7 rules at the contoso/fabrikam/adventure pod | North-south *behind* AGC: AGC → pod |
 
 **Proves step 1 (L7 policy) AND the inbound half of step 4. The story shifts here: AGC got us *into* the cluster, ACNS now controls what happens *within* it.** This is the punch line of the entire demo — the difference between L4 ("port 80 is allowed") and L7 ("GET on port 80 is allowed, POST is not").
 
@@ -565,6 +573,10 @@ GET /admin -> 403
 
 ### 4c. East-west L7
 
+| Tests | Layer | What's enforcing | Direction |
+|---|---|---|---|
+| **4c** client → contoso GET/POST, client → fabrikam | **ACNS L7** (east-west, no AGC involved) | Same `CiliumNetworkPolicy` L7 rules, applied to in-cluster pod-to-pod | **East-west: pod ↔ pod** |
+
 **This is the "get creative" bonus — and it's the *east-west* half of the framing.** Same Cilium L7 enforcement as 4b, but the source isn't AGC anymore. **There is no AGC in this picture at all.** One pod inside the cluster (`client`) is talking directly to another pod (`contoso`, `fabrikam`) over the cluster's internal network. ACNS L7 is enforcing on a path AGC never sees.
 
 **The ACNS framing for this test:** *"AGC controls the front door of the building. ACNS controls every interior door. Even if a pod is already inside the cluster — even if it's been compromised and is now the *source* of malicious traffic — ACNS still enforces the same method-and-path rules. There is no 'trusted east-west' in a zero-trust posture, and ACNS is what makes that real. This is the half of the traffic graph AGC was never designed to touch."*
@@ -597,6 +609,10 @@ client->fabrikam     -> 000
 
 ### 4d. Default-deny egress
 
+| Tests | Layer | What's enforcing | Direction |
+|---|---|---|---|
+| **4d** Backend pod → bing.com | **ACNS** default-deny egress | `default-deny-all` CNP at the pod | East-west out: pod → internet |
+
 **Proves the outbound half of step 4.** A backend pod tries to reach the public internet (`bing.com`). It can't — `default-deny-all` drops outbound traffic, and we never wrote an allow rule for the internet.
 
 The ask said *"For outbound, you could allow the controller endpoints and block everything else"* — that's exactly this pattern. We allow DNS in `allow-dns-egress` and nothing else. To allow specific FQDNs (e.g., a vendor API), you'd add another CNP with `toFQDNs: [matchName: "api.vendor.com"]`.
@@ -624,6 +640,10 @@ rc=1  (non-zero = blocked)
 **Talking point:** *"DNS works because we explicitly allowed it. The TCP connection to bing's actual IP just hangs forever. There's no listener missing, there's no firewall returning 'connection refused' — Cilium silently absorbs the packet at the eBPF datapath. From the attacker's perspective, the network is a black hole."*
 
 ### 4e. DNS still works
+
+| Tests | Layer | What's enforcing | Direction |
+|---|---|---|---|
+| **4e** DNS still resolves | **ACNS** carve-out | `allow-dns-egress` CNP | East-west to kube-dns |
 
 **Proves the carve-out is correctly scoped.** Even with default-deny in place, kube-dns is reachable because `allow-dns-egress` whitelists port 53 to the kube-dns endpoints with the L7 DNS rule `matchPattern: "*"` (any name allowed). **This is the litmus test that you blocked the right things and not too much.**
 
@@ -653,6 +673,10 @@ Address: 10.0.37.14
 ---
 
 ## 5. Live drop monitor (the "wow" moment)
+
+| Tests | Layer | What's enforcing | Direction |
+|---|---|---|---|
+| **5** Live drop monitor | **ACNS** observability | `cilium monitor` reading kernel events | Whichever direction you generate traffic in |
 
 **Optional but a crowd pleaser.** Cilium emits a kernel event for every packet it drops. ACNS exposes that via `cilium monitor`. Tail it in one window, generate a denied request from another, and watch the event scroll by in real time — including the HTTP method that triggered the drop. Makes the abstract "L7 policy" concrete: there's an actual byte-level decision happening on the data plane.
 
