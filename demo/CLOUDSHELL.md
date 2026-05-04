@@ -1,19 +1,46 @@
-# Replicate the demo from Azure Cloud Shell — zero git, all inline
+# AKS + Cilium L7 + Application Gateway for Containers — live demo runbook
 
-Open **Azure Cloud Shell** (Bash) at <https://shell.azure.com> or the `>_` icon in the portal. Cloud Shell already has `az`, `kubectl`, and `curl`. Paste each block in order.
+Replicate the demo from **Azure Cloud Shell** — zero git, every manifest inline so you can paste straight into a terminal.
+
+Open <https://shell.azure.com> or click the `>_` icon in the Azure portal. Cloud Shell already has `az`, `kubectl`, and `curl`. Paste each block below in order.
+
+---
+
+## Why this demo exists
+
+**The pitch in one sentence:** show that on AKS today you can put a managed Azure load balancer in front of multiple sites and enforce HTTP-aware (L7) security policies on every pod — including pods talking to each other inside the cluster — without bolting on an external service mesh.
+
+**The customer problem this solves.** A platform team running multi-tenant Kubernetes wants three things at once:
+
+1. **One front door, many apps.** A single managed ingress they don't have to operate (no nginx-ingress to patch, no Application Gateway v1 quirks, no manual TLS pipelines), with multi-site/multi-tenant routing baked in.
+2. **Zero-trust networking inside the cluster.** Default-deny everywhere — pods can't reach the internet, can't talk to each other, can't be talked to — *except* for traffic that's explicitly described in policy.
+3. **Real application-layer enforcement, not just port-level.** A "GET /products is fine, POST /admin is not" rule that actually works at the network layer, so a compromised neighbor pod can't pivot using approved L4 channels.
+
+Historically those three things came from three different products (an ingress controller, a CNI plugin, and a service mesh) glued together by the customer. **This demo shows you can get all three from native Azure platform features, with one cluster create command and a handful of YAML files.**
+
+**The four ingredients we glue together:**
+
+- **AKS** with **Azure CNI Overlay + Cilium dataplane** — provides the eBPF-powered networking that makes L7 policy possible.
+- **Advanced Container Networking Services (ACNS)** in **L7 mode** — exposes Cilium's HTTP awareness as a fully Azure-supported feature.
+- **Application Gateway for Containers (AGC)** as an **AKS add-on** — the managed L7 load balancer; AKS provisions it, manages its identity, and wires up its delegated subnet for you.
+- **Gateway API** (the upstream Kubernetes standard) — the YAML language we use to declare hostnames, routes, and TLS. Replaces classic Ingress objects.
+
+**What you'll see at the end.** One public AGC FQDN serving three different websites by hostname. POSTing to any of them returns `403` from Cilium *before nginx is reached*. A `client` pod inside the cluster can `GET /` from the contoso backend but cannot `POST` to it and cannot reach the fabrikam backend at all. Backend pods cannot resolve or reach `bing.com` even though DNS still works for in-cluster names. **Eleven automated checks, all green.**
 
 ---
 
 ## What we're building (the 4-step ask)
 
-This runbook implements the original ask end-to-end:
+This runbook implements the original ask end-to-end. Each section number below maps directly to one of these:
 
 1. **Deploy AKS with Cilium and L7 policy** — Azure CNI Overlay + Cilium dataplane + ACNS L7 advanced policies. ([docs](https://learn.microsoft.com/en-us/azure/aks/how-to-apply-l7-policies?tabs=cilium))
 2. **Enable the AGC add-on** — managed-by-AKS Application Gateway for Containers (no manual identity federation, no external controller). ([docs](https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/quickstart-deploy-application-gateway-for-containers-alb-controller-addon))
 3. **Multi-site on AGC** — three hostnames on one Gateway via Gateway API HTTPRoutes. ([docs](https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/how-to-multiple-site-hosting-gateway-api?tabs=alb-managed))
-4. **Default-deny ingress and egress** with explicit carve-outs (DNS only for egress, GET-only on the apps for ingress). Plus the bonus: an **east-west L7 policy** so an in-cluster pod can reach a frontend only with the methods/paths we allow.
+4. **Default-deny ingress and egress** with explicit carve-outs (DNS only for egress, GET-only on the apps for ingress). Plus the bonus: an **east-west L7 policy** so an in-cluster pod can reach an AGC-fronted service only with the methods/paths we allow.
 
-Narration tip: each numbered section below maps to one of those four pieces. The final test section is where the magic shows up — you literally watch Cilium return `403` for `POST` while letting `GET` through.
+**How long.** ~20 minutes end-to-end, mostly waiting for Azure to provision (`az aks create` ~7 min, AGC subnet association ~5 min). Hands-on keyboard time is maybe 5 min.
+
+**Narration tip.** Read the talking points before each block out loud while it's running. The final test section is where the punch lines land — you literally watch Cilium return `403` for `POST` while letting `GET` through, and you can tell the difference between "Cilium denied you" (403) and "the app didn't have that page" (404).
 
 ---
 
@@ -552,6 +579,38 @@ One command. Deletes the parent RG, which cascades to the AKS cluster, the auto-
 ```bash
 az group delete -n "$RESOURCE_GROUP" --yes --no-wait
 ```
+
+---
+
+## Wrap-up — what you just demonstrated
+
+If you ran every block, you proved the following on a real Azure cluster, end-to-end, in about 20 minutes:
+
+1. **An AKS cluster with Cilium dataplane and ACNS L7 policies** is just one `az aks create` away. No third-party charts, no service mesh sidecars.
+2. **Application Gateway for Containers can be fully managed by AKS.** The cluster owns the AGC resource lifecycle, the delegated subnet, and the workload identity federation — you never touched any of those by hand. Adding a fourth site is one `HTTPRoute` away.
+3. **Default-deny is the default.** With three small `CiliumNetworkPolicy` objects, every pod in `agc-sites` is locked down ingress *and* egress, with surgical carve-outs for the things you actually want (kube-dns, GET-only on the public sites).
+4. **L7 enforcement is real.** `POST /` returns `403` from Cilium *before nginx is reached* — and the same enforcement applies whether the source is the internet via AGC or another pod inside the cluster. There is no "trusted east-west" anymore.
+5. **You can prove the bouncer is the bouncer.** `GET /products` returns `404` (Cilium passes the request, nginx has no such file). `GET /admin` returns `403` (Cilium drops the request). That distinction tells your audience the policy isn't just decorative.
+
+### Talking points for the Q&A
+
+- *"How does this compare to a service mesh?"* — Service meshes also do L7 policy, but they install sidecars in every pod, intercept traffic at userspace, and add a few ms of latency per hop. Cilium does L7 in eBPF in the kernel, with no sidecars and effectively no latency tax. Trade-off: meshes give you mTLS, advanced retries/timeouts, and rich observability that Cilium L7 doesn't (yet) match.
+- *"Can I do mTLS with this?"* — TLS is terminated at AGC by default; backend traffic from AGC to pods is unencrypted unless you turn on **backend TLS** in the AGC config. For pod-to-pod mTLS you'd add Linkerd, Istio Ambient, or Cilium's own mTLS feature.
+- *"What about FQDN-based egress?"* — `CiliumNetworkPolicy` supports `toFQDNs: [{ matchName: api.contoso.com }]`. Same pattern as `allow-dns-egress` but selectively whitelist the external services your apps need. The "deny everything but the controller endpoints" pattern from the original ask is exactly that, applied to AKS's own egress requirements.
+- *"What if I need more than 3 sites?"* — Add another `HTTPRoute` and either expand the `site IN [...]` list in `allow-agc-l7-get-only` or add a per-site policy. The Gateway and the AGC stay one resource each.
+- *"Why managed-by-ALB instead of bring-your-own?"* — Because the customer's platform team doesn't want to be on the hook for managing AGC subnets, role assignments, or workload identities. Managed mode hands all that to AKS in exchange for slightly less flexibility (you can't pre-create the subnet or share the AGC across multiple clusters). For a single-cluster zero-trust pattern like this, managed wins.
+
+### Where to take it next
+
+- **Add TLS.** Listener `protocol: HTTPS`, attach a Key Vault-stored cert via `secretRef`, redirect HTTP→HTTPS with another HTTPRoute. AGC handles ACME-style cert rotation if you point at a Key Vault certificate.
+- **Add Hubble.** ACNS includes Cilium Hubble. `kubectl -n kube-system port-forward svc/hubble-ui 12000:80` and you have a UI for the same drop events you saw via `cilium monitor`.
+- **Wire up DNS.** Use Azure DNS (or any DNS provider) to point `*.example.com` at the AGC FQDN — drops the need for `curl --resolve`.
+- **Add an FQDN egress allow-list** for any backend services your apps actually need, then prove a denied FQDN still drops while an allowed one succeeds.
+- **Cost framing.** AGC is a managed PaaS resource (capacity units billed hourly). For a real demo against a customer, pull cost numbers via `az consumption usage list` and show the per-month line item.
+
+### The one-paragraph summary
+
+> *We built an AKS cluster where Azure runs an L7 load balancer in front of three websites, and Cilium acts as a bouncer at every pod's door — refusing any HTTP method or path we didn't explicitly allow, even from other pods in the cluster. Default-deny ingress and egress, with surgical allow rules for DNS and the public sites' GET endpoints. Eleven automated tests prove every layer is enforcing. Total infrastructure: one resource group, one AKS cluster, one AGC frontend, four CiliumNetworkPolicies. No service mesh, no third-party ingress controller, no manual identity wiring.*
 
 ---
 
