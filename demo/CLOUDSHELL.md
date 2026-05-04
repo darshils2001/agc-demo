@@ -359,7 +359,7 @@ done
 
 | # | Policy | Plain English |
 | - | ------ | ------------- |
-| 1 | `default-deny-all` | Empty selector, empty `ingress: []`, empty `egress: []`. Translation: **every pod in `agc-sites`, no traffic in or out, period.** This is the strict baseline you ask for in step 4. |
+| 1 | `default-deny-all` | Empty selector, one empty rule for `ingress` and one for `egress` (`[{}]`, **not** `[]`). Translation: **every pod in `agc-sites`, no traffic in or out, period.** Cilium's rule: a policy with a non-empty `ingress`/`egress` section flips the endpoint into default-deny for that direction. An *empty* list (`[]`) means "this rule does not apply at ingress/egress" — i.e., a no-op, which is why an `[]` version shows `VALID=False`. Use `[{}]`. |
 | 2 | `allow-dns-egress` | Carve-out so pods can still resolve service names via kube-dns. Without this, the next two policies would technically work but apps would fail to find each other by name. The `dns: matchPattern: "*"` makes Cilium parse and inspect actual DNS queries — not just allow port 53 blindly. |
 | 3 | `allow-agc-l7-get-only` | The interesting one. For pods labelled `site IN [contoso, fabrikam, adventure]`, allow ingress from **`world` AND `cluster`** (so AGC's data path AND in-cluster pods are covered) but **only `GET /` and `GET /products` on port 8080**. Anything else → Cilium returns 403 *before nginx ever sees it*. |
 | 4 | `client-may-call-contoso-get-only` | The east-west bonus. Pod with `app: client` may egress to pod with `app: contoso` on `GET /` only. Critically, both this AND policy 3 must allow the call — they're additive. POST fails because policy 3 denies, and `client → fabrikam` fails entirely because nothing whitelists it (default-deny wins). |
@@ -373,8 +373,10 @@ kind: CiliumNetworkPolicy
 metadata: { name: default-deny-all, namespace: agc-sites }
 spec:
   endpointSelector: {}
-  ingress: []
-  egress: []
+  ingress:
+    - {}
+  egress:
+    - {}
 ---
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
