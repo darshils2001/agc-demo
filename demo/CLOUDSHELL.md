@@ -623,11 +623,24 @@ In one Cloud Shell tab:
 kubectl -n kube-system exec -it ds/cilium -- cilium monitor --type drop
 ```
 
-In another tab, send a denied request:
+In another tab, send a denied request. **Cloud Shell tabs don't share environment variables**, so re-export the basics first:
 
 ```bash
+SUBSCRIPTION_ID="64d48c73-c5f4-4817-93d8-65908359d9b4"
+RESOURCE_GROUP="5-4-agc-demo"
+AKS_NAME="agcdemo-aks"
+APP_NAMESPACE="agc-sites"
+
+az account set --subscription "$SUBSCRIPTION_ID"
+az aks get-credentials -g "$RESOURCE_GROUP" -n "$AKS_NAME" --overwrite-existing
+
+FQDN=$(kubectl get gateway gateway-01 -n $APP_NAMESPACE -o jsonpath='{.status.addresses[0].value}')
+IP=$(getent hosts "$FQDN" | awk '{print $1}' | head -1)
+
 curl -X POST --resolve contoso.example.com:80:$IP http://contoso.example.com/
 ```
+
+> **Errata note**: if you skip the re-export and `$IP` is empty, curl fails with `curl: (49) Couldn't parse CURLOPT_RESOLVE entry 'contoso.example.com:80:'` — that's the giveaway that the variable isn't set in this tab.
 
 **Expected output in the monitor tab** (one or more lines like):
 
@@ -673,3 +686,4 @@ As issues come up running these instructions, the fix is recorded here.
 | Date | Symptom | Fix |
 | --- | --- | --- |
 | 2026-05-04 | `(FeatureNotFound) The feature 'AzureServiceMeshPreview' could not be found.` | That feature doesn't exist and isn't needed for this demo. Step 1 above no longer registers it — only `AdvancedNetworkingPreview` is registered. |
+| 2026-05-04 | In step 5 (cilium monitor), second tab fails with `curl: (49) Couldn't parse CURLOPT_RESOLVE entry 'contoso.example.com:80:'` | Cloud Shell tabs are independent shells — `$IP` and `$APP_NAMESPACE` from tab 1 aren't visible in tab 2. Re-export the variables and re-run `az aks get-credentials` + the FQDN/IP lookup at the top of every new tab. Step 5 above now shows the full re-export. |
