@@ -6,12 +6,12 @@ Open **Azure Cloud Shell** (Bash) at <https://shell.azure.com> or the `>_` icon 
 
 ## 0. Set variables and pick your subscription
 
-**Change `SUBSCRIPTION_ID` to yours.** `westus3` is the region that worked reliably for AGC.
+`westus3` is the region that worked reliably for AGC.
 
 ```bash
-export SUBSCRIPTION_ID="<your-subscription-id>"
+export SUBSCRIPTION_ID="64d48c73-c5f4-4817-93d8-65908359d9b4"   # rnautiyal@lab
 export LOCATION="westus3"
-export RESOURCE_GROUP="rg-agc-cilium-demo"
+export RESOURCE_GROUP="5-4-agc-demo"
 export AKS_NAME="agcdemo-aks"
 export ALB_NAMESPACE="alb-demo"
 export ALB_NAME="alb-demo"
