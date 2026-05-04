@@ -642,19 +642,39 @@ curl -X POST --resolve contoso.example.com:80:$IP http://contoso.example.com/
 
 > **Errata note**: if you skip the re-export and `$IP` is empty, curl fails with `curl: (49) Couldn't parse CURLOPT_RESOLVE entry 'contoso.example.com:80:'` — that's the giveaway that the variable isn't set in this tab.
 
-**Expected output in the monitor tab** (one or more lines like):
+**Expected output in the monitor tab.** You'll see a few different event types as the denied POST flows through. The exact identity numbers and IPs differ per cluster, but the shape is:
 
 ```text
-xx drop (Policy denied) flow 0x... to endpoint NNNN, ifindex N, file bpf_lxc.c:..., , identity world->NNNNN: <client-IP>:port -> <pod-IP>:8080 tcp ACK, FIN
+-> Request http from 0 ([reserved:world]) to 4521 ([k8s:app=contoso k8s:io.kubernetes.pod.namespace=agc-sites k8s:site=contoso]), identity 2->4521, verdict Denied POST http://contoso.example.com/ => 403
 ```
 
-You'll also see the L7 verdict if the request made it past L4 — `Verdict=DENIED` with method `POST` and path `/`.
+…and possibly an L4 drop event for related packets:
 
-**What it proves:**
+```text
+xx drop (Policy denied) flow 0x4f3a2b1c to endpoint 4521, ifindex 12, file bpf_lxc.c:1843, , identity 2->4521: 10.224.0.5:42118 -> 10.244.1.7:8080 tcp ACK
+```
 
-- The drop is happening on the **data plane** (`bpf_lxc.c` is the eBPF program in the kernel), not in some userspace controller polling logs after the fact.
-- The reason is `Policy denied` — the network-policy engine made the decision. Not a firewall, not nginx, not the kube-proxy.
-- It's immediate (sub-millisecond) and observable (every drop emits an event). For Hubble, this same stream populates the UI graph.
+**Why this is the expected output, line by line:**
+
+| Field | Meaning | Why it matters |
+|---|---|---|
+| `-> Request http` | Cilium's L7 HTTP proxy intercepted the request | Confirms ACNS L7 is active; a plain L4 NetworkPolicy would have no `http` event at all. |
+| `from 0 ([reserved:world])` | Source security identity. `reserved:world` = traffic that originated outside the cluster (i.e., from the AGC frontend, treated as "internet" from the pod's perspective) | Same identity AGC traffic gets — proves we're enforcing on the real production path, not a synthetic test. |
+| `to 4521 ([k8s:app=contoso ... k8s:site=contoso])` | Destination identity, derived from the contoso pod's labels | These are the exact labels the policy matches on (`site IN [contoso, fabrikam, adventure]`). Proves Cilium identified the destination correctly. |
+| `verdict Denied` | The policy engine's decision | This is the moneyshot. Not "rejected by app," not "firewalled" — `Denied` by the *network policy engine*. |
+| `POST http://contoso.example.com/ => 403` | The exact HTTP request that was dropped, plus the synthesized response code | **Cilium parsed the HTTP method and path, decided POST wasn't whitelisted, and crafted the 403 itself.** That's why you saw `403` in step 4b — Cilium wrote it. nginx never saw the request. |
+| `xx drop (Policy denied)` | Lower-level kernel-side drop event for L4 packets that were also dropped (e.g., the FIN tearing down the connection after the L7 deny) | Same decision, surfaced from the eBPF datapath. |
+| `file bpf_lxc.c:1843` | The exact source line in Cilium's eBPF program that emitted the drop | Proves the drop happens **in the kernel datapath**, not in userspace. Sub-microsecond, no context switch. |
+| `identity 2->4521` | Numeric form of the source/dest identities (2 = world, 4521 = contoso pods) | Cilium policy is **identity-based**, not IP-based. If the contoso pod is rescheduled to a new IP, the identity stays `4521` and the policy keeps working with no reconciliation. |
+
+**What it proves overall:**
+
+- **The decision is made in the kernel.** Not in nginx, not in a sidecar, not in a userspace controller polling logs. eBPF means microsecond-latency enforcement with no per-pod CPU overhead.
+- **Cilium synthesized the 403.** This is why step 4b's `POST -> 403` is L7 enforcement, not just connection drop. The byte sequence the client received was a real HTTP/1.1 403 written by Cilium's proxy — including headers — even though nginx was never reached.
+- **Identity-based, not IP-based.** The verdict was rendered against `identity=4521` (contoso's pod identity), which means it survives pod restarts, IP changes, scale-up, scale-down, and node-reschedules. This is what makes Cilium policy actually operable at scale.
+- **Every drop is observable.** That same event stream feeds Hubble, Hubble UI, and any Prometheus/OpenTelemetry pipeline. Customers don't lose visibility when they turn on policy — they gain a dimension of it.
+
+**Live-demo line:** *"Look at this. We didn't enable any logging. We didn't run a sniffer. Cilium just told us — in real time, from the kernel — that it dropped a POST from the AGC frontend to the contoso pod, and it even told us which line of its own eBPF code made the call. This is the data plane talking to us. That's why ACNS L7 customers don't need a separate observability product to know their policy is working."*
 
 ---
 
