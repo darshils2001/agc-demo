@@ -602,12 +602,21 @@ done
 > So we create with the forced OWASP, then **swap the entire `managedRuleSets` array atomically** in a single `update`.
 
 ```bash
-# 1a. Create the policy. --type/--version are required by the CLI; we'll swap the ruleset next.
-az network application-gateway waf-policy create \
-  --name agc-waf-policy \
-  --resource-group "$RESOURCE_GROUP" \
-  --location "$LOCATION" \
-  --type OWASP --version 3.2
+# 1a. Create the policy IF it doesn't already exist. We make this idempotent because
+#     `az ... waf-policy create` is an upsert — re-running it on an existing policy that's
+#     already attached to AGC will re-send `--type OWASP --version 3.2` and get rejected
+#     with `ApplicationGatewayFirewallAttachAGCUnsupportedRuleSetVersion`. So: only create
+#     if missing. The `update` calls below are themselves idempotent.
+if ! az network application-gateway waf-policy show \
+      --name agc-waf-policy --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
+  az network application-gateway waf-policy create \
+    --name agc-waf-policy \
+    --resource-group "$RESOURCE_GROUP" \
+    --location "$LOCATION" \
+    --type OWASP --version 3.2
+else
+  echo "WAF policy agc-waf-policy already exists — skipping create."
+fi
 
 # 1b. Atomically replace OWASP 3.2 with DRS 2.1 (the only ruleset AGC WAF supports) in one update.
 az network application-gateway waf-policy update \
@@ -1060,3 +1069,4 @@ As issues come up running these instructions, the fix is recorded here.
 | 2026-05-05 | Step 4a-bonus: `(ApplicationGatewayFirewallManagedRuleSetsHasMultiplePrimaryRuleSets)` after `rule-set add Microsoft_DefaultRuleSet`. | `az ... waf-policy create` forces OWASP 3.x, but AGC WAF only supports DRS 2.1. You can't `remove` OWASP first (`NoValidPrimaryRuleSetsAttached`) and you can't `add` DRS while OWASP is attached. The fix is to swap the entire `managedRuleSets` array atomically with `az ... update --set "managedRules.managedRuleSets=[{...DRS 2.1...}]"`. Step 4a-bonus now uses that pattern. |
 | 2026-05-05 | Step 4a-bonus: CRD stuck in `DeploymentFailed` with `LinkedAuthorizationFailed` / `does not have permission to perform 'microsoft.network/applicationgatewaywebapplicationfirewallpolicies/join/action'`. | The ALB Controller's managed identity (in the AKS node RG, named `azurealb-*`) needs the `join` permission on the WAF policy resource. Grant it `Network Contributor` scoped to the WAF policy. Step 4a-bonus's setup block now does this with `az role assignment create` before applying the CRD. After the role is granted, delete + re-apply the CRD to force the controller off its cached failure. |
 | 2026-05-05 | Step 4a-bonus 1e: `ALB Controller identity:` prints empty, then `az role assignment create` fails with `usage error: --assignee STRING \| --assignee-object-id GUID`. | The ALB Controller identity in the GA add-on is named `applicationloadbalancer-<aks>` (e.g. `applicationloadbalancer-agcdemo-aks`), not `azurealb-*`. The earlier filter `contains(name, 'alb')` doesn't match because the substring `alb` doesn't appear in `applicationloadbalancer`. Step 1e now matches `starts_with(name, 'applicationloadbalancer')` OR `starts_with(name, 'azurealb')`, prints the full identity table for visibility, and includes a manual-override fallback. |
+| 2026-05-05 | Re-running step 4a-bonus on a cluster where the WAF policy already exists fails at step 1a with `(ApplicationGatewayFirewallAttachAGCUnsupportedRuleSetVersion) RuleSet Version is not supported on Application Gateway for Containers resources`. | `az ... waf-policy create` is an upsert — on a re-run it tries to set `--type OWASP --version 3.2` on the already-attached policy, which AGC rejects (only DRS 2.1 is supported). Step 1a is now wrapped in `if ! az ... waf-policy show ...; then create; fi` so it's a no-op on re-runs. The `update --set` calls in 1b/1c are already idempotent. |
