@@ -486,16 +486,13 @@ All 4 should show `VALID=True`.
 ### 3f. Azure WAF policy on the AGC Gateway
 
 **Talking points:**
-- WAF is part of the *setup* — we want it programmed and `Programmed=True` before we start the demo, so step 4a-bonus is just two `curl`s, not a 5-minute role-assignment side-quest.
-- Two pieces of wiring: an **Azure WAF policy** resource that holds the rules (managed Default Rule Set 2.1 — same OWASP-class signatures as Front Door / standalone App Gateway WAF), and a **Kubernetes-side `WebApplicationFirewallPolicy` CRD** that points the ALB Controller at it.
-- We scope the CRD to the whole Gateway, so all three tenants (contoso, fabrikam, adventure) are protected by the same WAF policy.
-- The ALB Controller's managed identity needs `Network Contributor` on the WAF policy resource — without it, the CRD sits in `DeploymentFailed` with `LinkedAuthorizationFailed`.
 
-> **Why we use a single atomic `update --set managedRules...`:** AGC WAF *only* supports `Microsoft_DefaultRuleSet` (DRS) 2.1 — no OWASP, no Bot Manager. But `az ... waf-policy create` requires `--type/--version` and only accepts OWASP. You cannot fix this with two separate calls (`remove OWASP` then `add DRS`) because:
-> - `remove OWASP` fails with `NoValidPrimaryRuleSetsAttached` (a policy must always have one primary ruleset)
-> - `add DRS` fails with `HasMultiplePrimaryRuleSets` (can't add a second one)
->
-> So we create with the forced OWASP, then **swap the entire `managedRuleSets` array atomically** in a single `update`.
+- "Big picture: AGC is what gives this cluster a managed L7 front door. **WAF is the security feature that lives *on* that front door** — it inspects every request before AGC forwards it to a pod."
+- "Here's the line that matters for ACNS customers: **you can't get native Azure WAF on AKS L7 ingress without AGC.** A DIY ingress controller running on cluster nodes doesn't integrate with Azure WAF. So if a customer wants WAF as part of their AKS posture, AGC is the path."
+- "WAF and ACNS L7 are complementary, not redundant. AGC WAF blocks **signature-based attacks from the internet** — SQLi, XSS, path traversal, OWASP top-10 stuff. ACNS L7 blocks **behavioral misuse from any source** — wrong HTTP method, wrong path, lateral movement. Customers need both."
+- "What we're doing in this step: create an Azure WAF policy with the managed Default Rule Set 2.1 — the same signatures Front Door and standalone App Gateway WAF use — then attach it to our Gateway. Two YAMLs, scoped Gateway-wide so all three tenants are covered."
+- "Operational shape: WAF runs in **Prevention** mode for production and **Detection** mode for tuning. One CLI flag flips between them. You can also scope WAF per-`HTTPRoute` to roll it out per-tenant."
+- "The ALB Controller needs `Network Contributor` on the WAF policy to attach it — we grant that here so the CRD reconciles cleanly."
 
 ```bash
 # 1a. Create the policy IF it doesn't already exist. We make this idempotent because
@@ -975,22 +972,55 @@ Address: 10.0.37.14
 |---|---|---|---|
 | **5** Live drop monitor | **ACNS** observability | `cilium monitor` reading kernel events | Whichever direction you generate traffic in |
 
-**The story in one line:** Watch ACNS's enforcement happen in real time. Every drop in step 4 produced a kernel event; this is how you see those events live.
+**Talking points:**
 
-**AGC's role here:** **none.** Observability of in-cluster traffic is an ACNS-side capability.
+- "This is the same enforcement layer you saw in 4b–4e. Now we're watching it in real time, from the kernel."
+- "It's eBPF, in-kernel, identity-based. Events aren't 'IP X talked to IP Y' — they're 'identity *client* in namespace *agc-sites* tried to POST to identity *contoso*, verdict DENIED.'"
+- "This is the same data stream that feeds **Hubble**, **Container Insights**, and **Azure Monitor for AKS**. Every dashboard customers look at is downstream of this exact ring buffer."
+- "Two reasons customers love this: (1) L7 policy becomes tangible — they see real HTTP method strings; (2) it proves enforcement is happening at the dataplane, not in some cloud-side log aggregator running minutes behind."
+- "It's also how you'd debug an allow rule: tail the monitor, send the request, see exactly which rule decided."
 
-**ACNS's role here:** **everything.** `cilium monitor` is reading the eBPF event ring buffer on the agent that hosts the target pod. Every L7 verdict (allow / deny / proxy redirect) and every L4 drop produces an event with full identity and HTTP context.
+### Use `--type l7` for the demo, not `--type drop`
 
-- "This is the same enforcement layer you saw in 4b–4e. Now you're watching it from the kernel's perspective in real time."
-- "It's eBPF, in-kernel, identity-based. The event isn't 'IP X talked to IP Y' — it's 'identity *client* in namespace *agc-sites* tried to POST to identity *contoso*, verdict DENIED.'"
-- "This is the same data stream that feeds **Hubble** and Hubble UI, **Container Insights**, and **Azure Monitor for AKS**. You're seeing the source of truth — every aggregated dashboard is downstream of this exact event ring buffer."
-- "Customers love this for two reasons: (1) it makes 'L7 policy' tangible — they can see real HTTP method strings — and (2) it proves the enforcement is happening at the dataplane, not in some cloud-side log aggregator that runs minutes behind."
-- "Operationally, this is also how you'd debug a misbehaving allow rule: tail the monitor, generate the request, see exactly which rule made the decision."
-
-In one Cloud Shell tab:
+`cilium monitor --type drop` shows **everything** the eBPF datapath drops — including a lot of normal Linux housekeeping that isn't policy-related. We want the monitor focused on our policy verdicts.
 
 ```bash
-kubectl -n kube-system exec -it ds/cilium -- cilium monitor --type drop
+# Recommended for the demo — only HTTP-aware verdicts (the 4b POST 403, etc.)
+kubectl -n kube-system exec -it ds/cilium -- cilium monitor --type l7
+```
+
+### What `--type drop` looks like (and why most of it is noise)
+
+If you do run `cilium monitor --type drop`, you'll see a wall of lines like this on a fresh cluster, even before you generate any test traffic:
+
+```text
+xx drop (Unsupported L3 protocol) flow 0x0 to endpoint 0, ifindex 23, file bpf_lxc.c:1555, , identity 26755->unknown: fe80::4064:7eff:feba:a180 -> ff02::2 icmp RouterSolicitation
+xx drop (Unsupported L3 protocol) flow 0x0 to endpoint 0, ifindex 607, file bpf_lxc.c:1555, , identity 23337->unknown: :: -> ff02::1:ff40:f8c2 icmp NeighborSolicitation
+xx drop (Unsupported L3 protocol) flow 0x0 to endpoint 0, ifindex 607, file bpf_lxc.c:1555, , identity 23337->unknown: fe80::94f9:ffff:fe40:f8c2 -> ff02::16 icmp 143(0)
+```
+
+**This is expected. It is not a policy denial.** Three things to read off the lines:
+
+| Tell | What it means |
+|---|---|
+| `(Unsupported L3 protocol)` — *not* `(Policy denied)` | The drop reason is "the dataplane doesn't speak this protocol," not "the policy engine said no." Cilium isn't making a security decision here. |
+| All addresses are IPv6 (`fe80::/10` link-local, `ff02::/16` multicast, `::` unspecified) | Our cluster is **IPv4-only** (Azure CNI Overlay default). Cilium's eBPF programs on this datapath aren't built for v6, so any v6 packet hitting an LXC veth gets dropped at `bpf_lxc.c:1555`. |
+| Packet types are `RouterSolicitation`, `NeighborSolicitation`, `icmp 143(0)` | These are kernel housekeeping — every Linux pod emits them at startup and periodically: "is there a v6 router?", v6 ARP-equivalent, MLDv2 multicast listener reports. Nothing application-level. |
+
+**Why this is actually a good signal**, not a problem:
+
+- It proves the eBPF datapath is **active on every pod's veth**. Every new pod's network namespace produces these housekeeping packets, and Cilium is intercepting them all. If the dataplane were inert, you wouldn't see anything.
+- It proves **default-deny is real at the protocol level**. Cilium isn't blindly forwarding packets it doesn't understand; it drops them and tells you why.
+- Customers running **dual-stack v4+v6** clusters wouldn't see these — Cilium handles v6 natively. The drops only appear because *we explicitly chose v4-only* in step 2.
+
+So when you see this in the demo, say: *"Those are IPv6 packets the kernel emits automatically, dropped because we built a v4-only cluster. They prove the datapath is live on every pod, which is the precondition for L7 enforcement to even be possible. Now let's filter to the actual policy events."* Then switch to `--type l7`.
+
+### Generate the policy verdict
+
+In one Cloud Shell tab, start the L7 monitor:
+
+```bash
+kubectl -n kube-system exec -it ds/cilium -- cilium monitor --type l7
 ```
 
 In another tab, send a denied request. **Cloud Shell tabs don't share environment variables**, so re-export the basics first:
@@ -1012,17 +1042,19 @@ curl -X POST --resolve contoso.example.com:80:$IP http://contoso.example.com/
 
 > **Errata note**: if you skip the re-export and `$IP` is empty, curl fails with `curl: (49) Couldn't parse CURLOPT_RESOLVE entry 'contoso.example.com:80:'` — that's the giveaway that the variable isn't set in this tab.
 
-**Expected output in the monitor tab.** You'll see a few different event types as the denied POST flows through. The exact identity numbers and IPs differ per cluster, but the shape is:
+**Expected output in the L7 monitor tab.** The exact identity numbers and IPs differ per cluster, but the shape is:
 
 ```text
 -> Request http from 0 ([reserved:world]) to 4521 ([k8s:app=contoso k8s:io.kubernetes.pod.namespace=agc-sites k8s:site=contoso]), identity 2->4521, verdict Denied POST http://contoso.example.com/ => 403
 ```
 
-…and possibly an L4 drop event for related packets:
+If you also have `--type drop` running, you may see an L4 drop event for related packets (e.g., the FIN tearing down the connection after the L7 deny):
 
 ```text
 xx drop (Policy denied) flow 0x4f3a2b1c to endpoint 4521, ifindex 12, file bpf_lxc.c:1843, , identity 2->4521: 10.224.0.5:42118 -> 10.244.1.7:8080 tcp ACK
 ```
+
+Note `(Policy denied)` here — *that's* the security-relevant drop, distinct from the `(Unsupported L3 protocol)` housekeeping noise above.
 
 **Why this is the expected output, line by line:**
 
@@ -1033,7 +1065,7 @@ xx drop (Policy denied) flow 0x4f3a2b1c to endpoint 4521, ifindex 12, file bpf_l
 | `to 4521 ([k8s:app=contoso ... k8s:site=contoso])` | Destination identity, derived from the contoso pod's labels | These are the exact labels the policy matches on (`site IN [contoso, fabrikam, adventure]`). Proves Cilium identified the destination correctly. |
 | `verdict Denied` | The policy engine's decision | This is the moneyshot. Not "rejected by app," not "firewalled" — `Denied` by the *network policy engine*. |
 | `POST http://contoso.example.com/ => 403` | The exact HTTP request that was dropped, plus the synthesized response code | **Cilium parsed the HTTP method and path, decided POST wasn't whitelisted, and crafted the 403 itself.** That's why you saw `403` in step 4b — Cilium wrote it. nginx never saw the request. |
-| `xx drop (Policy denied)` | Lower-level kernel-side drop event for L4 packets that were also dropped (e.g., the FIN tearing down the connection after the L7 deny) | Same decision, surfaced from the eBPF datapath. |
+| `xx drop (Policy denied)` | Kernel-side drop event for related L4 packets after the L7 deny | Same decision, surfaced from the eBPF datapath. **Different from `(Unsupported L3 protocol)`** — that one is housekeeping; this one is policy. |
 | `file bpf_lxc.c:1843` | The exact source line in Cilium's eBPF program that emitted the drop | Proves the drop happens **in the kernel datapath**, not in userspace. Sub-microsecond, no context switch. |
 | `identity 2->4521` | Numeric form of the source/dest identities (2 = world, 4521 = contoso pods) | Cilium policy is **identity-based**, not IP-based. If the contoso pod is rescheduled to a new IP, the identity stays `4521` and the policy keeps working with no reconciliation. |
 
@@ -1042,7 +1074,7 @@ xx drop (Policy denied) flow 0x4f3a2b1c to endpoint 4521, ifindex 12, file bpf_l
 - **The decision is made in the kernel.** Not in nginx, not in a sidecar, not in a userspace controller polling logs. eBPF means microsecond-latency enforcement with no per-pod CPU overhead.
 - **Cilium synthesized the 403.** This is why step 4b's `POST -> 403` is L7 enforcement, not just connection drop. The byte sequence the client received was a real HTTP/1.1 403 written by Cilium's proxy — including headers — even though nginx was never reached.
 - **Identity-based, not IP-based.** The verdict was rendered against `identity=4521` (contoso's pod identity), which means it survives pod restarts, IP changes, scale-up, scale-down, and node-reschedules. This is what makes Cilium policy actually operable at scale.
-- **Every drop is observable.** That same event stream feeds Hubble, Hubble UI, and any Prometheus/OpenTelemetry pipeline. Customers don't lose visibility when they turn on policy — they gain a dimension of it.
+- **Every drop is observable, and every drop has a *reason*.** `(Policy denied)` for security, `(Unsupported L3 protocol)` for housekeeping. Same event stream feeds Hubble, Hubble UI, and any Prometheus/OpenTelemetry pipeline. Customers don't lose visibility when they turn on policy — they gain a dimension of it.
 
 **Live-demo line:** *"Look at this. We didn't enable any logging. We didn't run a sniffer. Cilium just told us — in real time, from the kernel — that it dropped a POST from the AGC frontend to the contoso pod, and it even told us which line of its own eBPF code made the call. This is the data plane talking to us. That's why ACNS L7 customers don't need a separate observability product to know their policy is working."*
 
