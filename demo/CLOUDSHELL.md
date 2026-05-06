@@ -782,14 +782,14 @@ Read the three lines top to bottom — they tell the whole story:
 |---|---|---|---|
 | **4e** DNS still resolves | **ACNS** carve-out | `allow-dns-egress` CNP | East-west to kube-dns |
 
-**What we're testing:** From inside the same locked-down namespace, can the client pod still resolve a Service name via cluster DNS?
+**What we're testing:** Same locked-down pod we just used in 4d. This time, instead of trying to reach the public internet, we have it do a `nslookup` for a Service name inside the cluster — `contoso.agc-sites.svc.cluster.local`. The expectation: this one **succeeds**. Same pod, same policies, different outcome.
 
 **What it shows:**
 
-- 4d showed default-deny working. 4e shows we didn't just "unplug the network" — we built a *precise* allow list that keeps apps functional. `allow-dns-egress` is the one carve-out that makes default-deny survivable.
-- Compare with 4d: same pod, same policies. DNS resolved (allowed); TCP to bing didn't (denied). **Same network primitives, two outcomes — that precision is the demo.**
-- The carve-out is tightenable. Replace `matchPattern: '*'` with `matchPattern: '*.contoso.com'` and Cilium silently drops every other DNS query *itself*, not just the eventual TCP connection.
-- This is the difference between "we have policy" (an audit checkbox) and "we can demonstrate policy enforcing surgically" (a production posture).
+- **This is the "we didn't just unplug the network" test.** A blanket default-deny is easy. Anyone can write one. The hard part — and the customer's actual ask — is keeping apps *functional* while denying everything else. 4d proved we deny. 4e proves we deny *surgically*.
+- **Why DNS is the carve-out that matters.** If pods can't do DNS, nothing in Kubernetes works. Service discovery breaks, controllers break, every client library breaks. So the very first allow rule in any zero-trust setup is "let pods talk to kube-dns." That's exactly what `allow-dns-egress` does — and nothing else.
+- **The contrast with 4d is the whole story.** Same pod. Same policies attached. In 4d the pod tried to reach bing.com → silent timeout. In 4e the pod resolves a cluster Service → instant answer. **Same network primitives, opposite outcomes** — that precision is what production-grade zero-trust looks like.
+- **And it's tightenable.** Today the rule allows DNS to any name (`matchPattern: '*'`). Swap that to `matchPattern: '*.svc.cluster.local'` and Cilium will start dropping the DNS *queries themselves* for anything outside the cluster — before they even leave the node. One-line YAML change.
 
 ```bash
 kubectl exec -n $APP_NAMESPACE $CLIENT -- nslookup contoso.agc-sites.svc.cluster.local
@@ -808,9 +808,12 @@ Address: 10.0.37.14
 
 **What the output means:**
 
-- **`Server: 10.0.0.10:53`** — that's the kube-dns ClusterIP. The client pod successfully reached it on port 53. Egress to *that* destination, on *that* port, with the *DNS protocol*, was permitted by `allow-dns-egress`.
-- **`Address: 10.0.37.14`** — the resolved Service IP for contoso. A real DNS answer, not a timeout, not NXDOMAIN.
-- **Compare with 4d.** Same pod resolved `www.bing.com` (DNS allowed) but couldn't connect to it (TCP denied). DNS is uniformly allowed (by name pattern `*`), but **TCP/UDP to anywhere except kube-dns:53** is dropped. That's the precision the customer ask demanded.
+Read the output against 4d's output side by side — that's where the point lands:
+
+- **`Server: 10.0.0.10:53`** — that's the kube-dns ClusterIP. The pod successfully reached it on port 53. So egress to *that one destination, on that one port, speaking DNS* was allowed. That's `allow-dns-egress` doing exactly what it says.
+- **`Address: 10.0.37.14`** — a real DNS answer for the contoso Service. Not a timeout, not NXDOMAIN, not "I/O error." Service discovery is fully working.
+- **Now compare to 4d.** This is the same pod. The same four CiliumNetworkPolicies are attached. In 4d it tried to reach `www.bing.com` and got a silent timeout. In 4e it asks kube-dns a question and gets an instant answer. **Nothing about the pod changed — the only thing that determined success or failure was whether the destination matched an allow rule.**
+- **That's the whole zero-trust posture in one comparison.** Default-deny everywhere, plus a small set of explicit carve-outs. Anything on the list works normally. Anything off the list dies silently in the kernel. No app changes, no sidecars, no agents — just policy.
 
 > **Verdict:** ACNS allowed this one specific call (port 53 to kube-dns endpoints) because it's the carve-out we explicitly wrote.
 
