@@ -1036,6 +1036,38 @@ az group delete -n "$RESOURCE_GROUP" --yes --no-wait
 
 ---
 
+## Recap — what we just did (read this out at the end)
+
+Walk the audience back through the demo in plain language. Hit each bullet:
+
+**What we built:**
+- A single AKS cluster with two add-ons turned on at create time: **AGC** (Application Gateway for Containers) for ingress and **ACNS L7** (Advanced Container Networking Services) for in-cluster policy.
+- Three sample tenants — contoso, fabrikam, adventure — fronted by **one** AGC public IP and **one** Gateway, with three `HTTPRoute` objects routing by hostname.
+- Four `CiliumNetworkPolicy` objects: default-deny, DNS carve-out, an L7 GET-only allow for AGC traffic, and an east-west allow from the client pod to contoso.
+- An **Azure WAF policy** with the managed Default Rule Set 2.1, attached to the Gateway via a `WebApplicationFirewallPolicy` CRD.
+
+**What we proved, test by test:**
+- **4a — AGC routes by hostname.** Same public IP, three different `<h1>Hello from <site></h1>` responses. One Gateway + three `HTTPRoute`s replaced what used to be a DIY ingress controller.
+- **4a-bonus — AGC has WAF built in.** A SQLi payload and a path-traversal payload both hit `403` *at AGC*. nginx never saw them. Same `GET /` from 4a still returned `200` — WAF didn't break the app.
+- **4b — ACNS L7 inspects HTTP.** `POST /` returned `403` (synthesized by Cilium); `GET /products` returned `404` (served by nginx). **403 from Cilium, 404 from nginx** — proof that L7 inspection is real, not blanket-block.
+- **4c — ACNS enforces east-west too.** Pod-to-pod, no AGC in the path. `client → contoso GET` got `200`, `client → contoso POST` got `403`, `client → fabrikam` got `000` (TCP never completed). Three calls, three different layers of denial.
+- **4d — ACNS blocks egress by default.** A backend pod tried to reach bing.com, got a silent timeout. No exfil, no C2.
+- **4e — The lockdown is precise.** Same pod still resolves DNS through kube-dns, because we explicitly allowed it.
+- **5 — Every drop is observable.** `cilium monitor` showed the kernel-level event for the denied POST: identity, HTTP method, the eBPF source line that made the call.
+
+**The one-line story:**
+- **AGC brings traffic *into* the cluster.** With WAF, AGC also blocks signature-based attacks at the edge.
+- **ACNS L7 controls how traffic flows *within* the cluster** — north-south behind AGC, east-west pod-to-pod, and outbound to the internet.
+- Two add-ons, one zero-trust posture, end to end.
+
+**Why this matters to the customer:**
+- Managed Azure load balancer instead of a DIY ingress controller running on cluster nodes.
+- Native Azure WAF on AKS L7 ingress — only available through AGC.
+- L7 enforcement at the pod with **identity-based, eBPF-speed** policy — no sidecar, no proxy injection, no per-pod CPU overhead.
+- Everything driven by upstream Kubernetes APIs (Gateway API, NetworkPolicy CRDs) plus one Azure CRD per WAF policy.
+
+---
+
 ## Q&A reference links (for live demo)
 
 Keep this section open in another tab during Q&A.
