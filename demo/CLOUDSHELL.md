@@ -12,8 +12,6 @@ Hands-on-keyboard runbook. Paste each block into **Azure Cloud Shell** (<https:/
 
 **Talking points:**
 - Set these to whatever subscription / region / resource group / cluster name you're using. The values below are placeholders — swap them for your own. The rest of the runbook references these variables, so you only edit them once here.
-- Pick a region where AGC is generally available and your subscription has capacity for a small AKS cluster. AGC is multi-region; if a particular region returns transient `Microsoft.ServiceNetworking` errors during AGC subnet association, switch regions and retry. The AGC controller will surface these errors clearly in `az network alb association list`.
-- **Region note from this build:** `westus3` was reliable end-to-end; `eastus2` hit transient AGC subnet-association errors during provisioning. If `kubectl wait` on the `ApplicationLoadBalancer` in 3b sits at `Updating` for >10 min, that's the signature — switch regions.
 - Two namespaces: `$ALB_NAMESPACE` holds the AGC `ApplicationLoadBalancer` CR (the AGC frontend's intent lives here), `$APP_NAMESPACE` holds the workloads + Cilium policies. This split mirrors the ownership boundary we recommend in AGC docs — platform team owns the ALB namespace, app team owns the workload namespace.
 
 
@@ -62,17 +60,19 @@ az group create -n "$RESOURCE_GROUP" -l "$LOCATION"
 
 ## 2. Create the AKS cluster (~7 min)
 
-**This is step 1 + step 2 of the ask in a single command.** Talking points to hit while it's provisioning:
+**This is step 1 + step 2 of the ask in a single command.** Two flags do the heavy lifting — lead with these:
 
-- `--network-plugin azure --network-plugin-mode overlay` — pods get IPs from a non-routable overlay (`10.244.0.0/16`), which keeps the VNet plan small. Pod-to-pod still works directly because Cilium handles encapsulation.
-- `--network-dataplane cilium` — replaces kube-proxy/iptables with Cilium's eBPF dataplane. Required for L7 enforcement; Azure NPM can't do L7.
-- `--enable-acns --acns-advanced-networkpolicies L7` — turns on **Advanced Container Networking Services** in L7 mode. This is what makes Cilium understand HTTP method/path/header rules — not just port rules.
-- `--enable-application-load-balancer` — installs the **AGC add-on**: two `alb-controller` pods in `kube-system`. They watch Gateway API objects in the cluster and translate them into AGC config in Azure. **AKS owns the controller image, the workload-identity federation, the delegated subnet (`aks-appgateway` in the `MC_*` RG), and the AGC resource itself.** No Helm chart, no manual identity glue. The trade-off worth saying out loud: you can't customize the controller image — if a customer needs a fork, they can't use the managed add-on.
-- `--enable-gateway-api` — installs the upstream Gateway API CRDs (`Gateway`, `HTTPRoute`, `GatewayClass`) and registers `azure-alb-external` as the implementing GatewayClass.
-- `--enable-oidc-issuer --enable-workload-identity` — required so AGC's controller can authenticate to Azure as a workload identity (no client secrets, no service principal handoff).
-- `Standard_D4s_v5 x 2` — modest size; the demo doesn't need more. SSH disabled because we don't ever shell into the nodes.
+- **`--enable-acns --acns-advanced-networkpolicies L7`** — turns on **Advanced Container Networking Services (ACNS)** in L7 mode. This is the magic flag that lets Cilium understand HTTP — method, path, headers — not just ports. Everything in steps 4b–4e depends on this one flag.
+- **`--enable-application-load-balancer`** — installs the **AGC add-on**. AKS provisions the ALB Controller, the workload-identity federation, the delegated subnet, and the AGC Azure resource itself. No Helm chart, no manual identity glue. Trade-off worth saying out loud: you can't customize the controller image — if a customer needs a fork, the managed add-on isn't for them.
 
-After create, we pull credentials and verify three things: nodes Ready, both `alb-controller` pods Running, and the GatewayClass `Accepted=True`. If any of those is wrong, nothing downstream will work.
+The rest of the flags are supporting cast — mention briefly if asked:
+
+- `--network-plugin azure --network-plugin-mode overlay` + `--network-dataplane cilium` — Azure CNI Overlay for IP plan, Cilium eBPF for the dataplane (required for L7).
+- `--enable-gateway-api` — installs Gateway API CRDs and the `azure-alb-external` GatewayClass.
+- `--enable-oidc-issuer --enable-workload-identity` — lets the AGC controller authenticate to Azure without secrets.
+- `Standard_D4s_v5 × 2`, SSH disabled — modest, locked-down nodes; we never shell in.
+
+After create, verify three things: nodes Ready, both `alb-controller` pods Running, GatewayClass `Accepted=True`. If any of those is wrong, nothing downstream will work.
 
 ```bash
 az aks create \
@@ -375,16 +375,27 @@ EOF
 3. Then carve out the **north-south path through AGC** with HTTP-method-and-path precision (`allow-agc-l7-get-only`) — this is what makes AGC → pod traffic work, but only for `GET /` and `GET /products`.
 4. Finally carve out a specific **east-west path** (`client-may-call-contoso-get-only`) so the in-cluster `client` pod can call `contoso` — again, only `GET /`. This one is optional for ingress security but lets us demo east-west enforcement in 4c.
 
-**This is step 4 of the ask plus the "get creative" bonus.** Read each policy aloud — they layer:
+**This is step 4 of the ask plus the "get creative" bonus.** Each policy adds one specific allowance on top of default-deny. Read them as a stack:
 
-| # | Policy | Plain English |
-| - | ------ | ------------- |
-| 1 | `default-deny-all` | Empty selector, one empty rule for `ingress` and one for `egress` (`[{}]`, **not** `[]`). Translation: **every pod in `agc-sites`, no traffic in or out, period.** Cilium's rule: a policy with a non-empty `ingress`/`egress` section flips the endpoint into default-deny for that direction. An *empty* list (`[]`) means "this rule does not apply at ingress/egress" — i.e., a no-op, which is why an `[]` version shows `VALID=False`. Use `[{}]`. |
-| 2 | `allow-dns-egress` | Carve-out so pods can still resolve service names via kube-dns. Without this, the next two policies would technically work but apps would fail to find each other by name. The `dns: matchPattern: "*"` makes Cilium parse and inspect actual DNS queries — not just allow port 53 blindly. |
-| 3 | `allow-agc-l7-get-only` | The interesting one. For pods labelled `site IN [contoso, fabrikam, adventure]`, allow ingress from **`world` AND `cluster`** (so AGC's data path AND in-cluster pods are covered) but **only `GET /` and `GET /products` on port 8080**. Anything else → Cilium returns 403 *before nginx ever sees it*. |
-| 4 | `client-may-call-contoso-get-only` | The east-west bonus. Pod with `app: client` may egress to pod with `app: contoso` on `GET /` only. Critically, both this AND policy 3 must allow the call — they're additive. POST fails because policy 3 denies, and `client → fabrikam` fails entirely because nothing whitelists it (default-deny wins). |
+**Policy 1 — `default-deny-all` (the baseline)**
+- Selects every pod in `agc-sites` and denies all ingress + egress.
+- After *just* this policy: nothing works, not even DNS. That's the point.
+- Syntax gotcha: the rules are `ingress: [{}]` and `egress: [{}]` — one empty rule, **not** an empty list `[]`. Empty list means "this policy doesn't apply," which is a no-op (and shows `VALID=False`).
 
-**Why include `cluster` in `fromEntities`** in policy 3: AGC routes traffic through a node-local hop that Cilium identifies as `cluster`, not `world`. If you only allow `world`, the GET sometimes returns 403 even though the L7 rule matches. This caught us during build — listing both is the correct pattern.
+**Policy 2 — `allow-dns-egress` (the survival kit)**
+- Lets every pod talk to kube-dns on port 53.
+- `dns: matchPattern: "*"` makes Cilium *parse* the DNS query, not just blindly allow port 53. You could narrow it later (e.g. `*.cluster.local`).
+- Without this, policies 3 and 4 would technically work but apps couldn't find each other by name.
+
+**Policy 3 — `allow-agc-l7-get-only` (the north-south allow)**
+- For pods labelled `site ∈ {contoso, fabrikam, adventure}`: allow inbound on port 8080, but only `GET /` and `GET /products`.
+- Sources allowed: `world` **and** `cluster`. AGC traffic enters the pod via a node-local hop that Cilium tags as `cluster`, not `world` — if you only allow `world`, the GET sometimes returns 403 even when the path matches. List both. (This caught us during build.)
+- Anything outside that allow-list — wrong method, wrong path — gets a Cilium-synthesized 403 *before nginx sees it*. That's the headline of step 4b.
+
+**Policy 4 — `client-may-call-contoso-get-only` (the east-west allow)**
+- Pod with `app: client` may call pod with `app: contoso` on `GET /` only.
+- Both this policy AND policy 3 must permit the call — Cilium policies are **additive**, so the source's egress allow and the destination's ingress allow must agree.
+- Why this matters in step 4c: `client → contoso POST` fails (policy 3 denies the method); `client → fabrikam` fails entirely (no policy whitelists it, default-deny wins).
 
 **After these four are applied,** the cluster is in the final demo state: AGC traffic for `GET /` and `GET /products` works; everything else is dropped at the pod boundary, observable via `cilium monitor` in step 5.
 
