@@ -631,10 +631,19 @@ echo "$WAF_ID"
 # 1e. Grant the ALB Controller's managed identity permission to "join" the WAF policy.
 #     Without this, the CRD will sit in DeploymentFailed with LinkedAuthorizationFailed
 #     ("does not have permission to perform 'microsoft.network/applicationgatewaywebapplicationfirewallpolicies/join/action'").
-#     The ALB Controller add-on creates a managed identity in the AKS node RG; we grab its objectId here.
+#     The ALB Controller add-on creates a managed identity in the AKS node RG. Naming varies
+#     across add-on versions (`azurealb-*`, `<aks>-agentpool`, etc.), so we list and pick.
 NODE_RG=$(az aks show -g "$RESOURCE_GROUP" -n "$AKS_NAME" --query nodeResourceGroup -o tsv)
+echo "Node RG: $NODE_RG"
+echo "Identities in node RG:"
+az identity list -g "$NODE_RG" --query "[].{name:name,principalId:principalId}" -o table
+
+# Pick the ALB controller identity. Try common name patterns; fall back to manual lookup.
 ALB_PRINCIPAL_ID=$(az identity list -g "$NODE_RG" \
-  --query "[?starts_with(name, 'azurealb-')].principalId | [0]" -o tsv)
+  --query "[?contains(name, 'alb') || contains(name, 'azurealb')].principalId | [0]" -o tsv)
+
+# If empty, set it manually from the table above (look for the alb-related identity):
+# ALB_PRINCIPAL_ID=<paste-objectid-here>
 echo "ALB Controller identity: $ALB_PRINCIPAL_ID"
 
 az role assignment create \
