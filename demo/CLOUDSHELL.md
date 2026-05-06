@@ -638,11 +638,15 @@ echo "Node RG: $NODE_RG"
 echo "Identities in node RG:"
 az identity list -g "$NODE_RG" --query "[].{name:name,principalId:principalId}" -o table
 
-# Pick the ALB controller identity. Try common name patterns; fall back to manual lookup.
+# Pick the ALB controller identity. Naming varies across add-on versions:
+#   - `applicationloadbalancer-<aks>` (current GA naming, e.g. applicationloadbalancer-agcdemo-aks)
+#   - `azurealb-<aks>` (older preview naming)
+# We match either pattern. If neither matches, set it manually from the table above.
 ALB_PRINCIPAL_ID=$(az identity list -g "$NODE_RG" \
-  --query "[?contains(name, 'alb') || contains(name, 'azurealb')].principalId | [0]" -o tsv)
+  --query "[?starts_with(name, 'applicationloadbalancer') || starts_with(name, 'azurealb')].principalId | [0]" -o tsv)
 
-# If empty, set it manually from the table above (look for the alb-related identity):
+# If empty, set it manually from the table above (the ALB controller identity is the one
+# whose name starts with `applicationloadbalancer-` or `azurealb-`):
 # ALB_PRINCIPAL_ID=<paste-objectid-here>
 echo "ALB Controller identity: $ALB_PRINCIPAL_ID"
 
@@ -1055,3 +1059,4 @@ As issues come up running these instructions, the fix is recorded here.
 | 2026-05-04 | In step 5 (cilium monitor), second tab fails with `curl: (49) Couldn't parse CURLOPT_RESOLVE entry 'contoso.example.com:80:'` | Cloud Shell tabs are independent shells — `$IP` and `$APP_NAMESPACE` from tab 1 aren't visible in tab 2. Re-export the variables and re-run `az aks get-credentials` + the FQDN/IP lookup at the top of every new tab. Step 5 above now shows the full re-export. |
 | 2026-05-05 | Step 4a-bonus: `(ApplicationGatewayFirewallManagedRuleSetsHasMultiplePrimaryRuleSets)` after `rule-set add Microsoft_DefaultRuleSet`. | `az ... waf-policy create` forces OWASP 3.x, but AGC WAF only supports DRS 2.1. You can't `remove` OWASP first (`NoValidPrimaryRuleSetsAttached`) and you can't `add` DRS while OWASP is attached. The fix is to swap the entire `managedRuleSets` array atomically with `az ... update --set "managedRules.managedRuleSets=[{...DRS 2.1...}]"`. Step 4a-bonus now uses that pattern. |
 | 2026-05-05 | Step 4a-bonus: CRD stuck in `DeploymentFailed` with `LinkedAuthorizationFailed` / `does not have permission to perform 'microsoft.network/applicationgatewaywebapplicationfirewallpolicies/join/action'`. | The ALB Controller's managed identity (in the AKS node RG, named `azurealb-*`) needs the `join` permission on the WAF policy resource. Grant it `Network Contributor` scoped to the WAF policy. Step 4a-bonus's setup block now does this with `az role assignment create` before applying the CRD. After the role is granted, delete + re-apply the CRD to force the controller off its cached failure. |
+| 2026-05-05 | Step 4a-bonus 1e: `ALB Controller identity:` prints empty, then `az role assignment create` fails with `usage error: --assignee STRING \| --assignee-object-id GUID`. | The ALB Controller identity in the GA add-on is named `applicationloadbalancer-<aks>` (e.g. `applicationloadbalancer-agcdemo-aks`), not `azurealb-*`. The earlier filter `contains(name, 'alb')` doesn't match because the substring `alb` doesn't appear in `applicationloadbalancer`. Step 1e now matches `starts_with(name, 'applicationloadbalancer')` OR `starts_with(name, 'azurealb')`, prints the full identity table for visibility, and includes a manual-override fallback. |
