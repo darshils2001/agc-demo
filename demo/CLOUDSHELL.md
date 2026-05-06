@@ -597,22 +597,23 @@ done
 
 ```bash
 # 1. Create the Azure WAF policy with DRS 2.1 (the only managed ruleset AGC WAF supports).
+#    Note: --type/--version on `create` only accept OWASP/3.2; DRS 2.1 is added separately below.
 az network application-gateway waf-policy create \
   --name agc-waf-policy \
-  --resource-group $RG \
-  --location $LOCATION \
+  --resource-group "$RESOURCE_GROUP" \
+  --location "$LOCATION" \
   --type OWASP --version 3.2
 
 az network application-gateway waf-policy managed-rule rule-set add \
-  --policy-name agc-waf-policy --resource-group $RG \
+  --policy-name agc-waf-policy --resource-group "$RESOURCE_GROUP" \
   --type Microsoft_DefaultRuleSet --version 2.1
 
 az network application-gateway waf-policy update \
-  --name agc-waf-policy --resource-group $RG \
+  --name agc-waf-policy --resource-group "$RESOURCE_GROUP" \
   --set policySettings.mode=Prevention policySettings.state=Enabled
 
 WAF_ID=$(az network application-gateway waf-policy show \
-  --name agc-waf-policy --resource-group $RG --query id -o tsv)
+  --name agc-waf-policy --resource-group "$RESOURCE_GROUP" --query id -o tsv)
 echo "$WAF_ID"
 
 # 2. Bind it to our Gateway via the ALB Controller's WebApplicationFirewallPolicy CRD.
@@ -635,6 +636,12 @@ EOF
 # 3. Confirm the CRD reports the policy as programmed.
 kubectl get webapplicationfirewallpolicy -n $APP_NAMESPACE agc-gateway-waf -o yaml | tail -20
 ```
+
+> **If kubectl prints `the server has asked for the client to provide credentials`** \u2014 your Cloud Shell session lost the AKS cluster credentials (common after an idle disconnect). Re-run:
+>
+> ```bash
+> az aks get-credentials -g "$RESOURCE_GROUP" -n "$AKS_NAME" --overwrite-existing
+> ```
 
 **Expected setup output:**
 
