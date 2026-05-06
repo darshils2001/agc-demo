@@ -628,6 +628,21 @@ WAF_ID=$(az network application-gateway waf-policy show \
   --name agc-waf-policy --resource-group "$RESOURCE_GROUP" --query id -o tsv)
 echo "$WAF_ID"
 
+# 1e. Grant the ALB Controller's managed identity permission to "join" the WAF policy.
+#     Without this, the CRD will sit in DeploymentFailed with LinkedAuthorizationFailed
+#     ("does not have permission to perform 'microsoft.network/applicationgatewaywebapplicationfirewallpolicies/join/action'").
+#     The ALB Controller add-on creates a managed identity in the AKS node RG; we grab its objectId here.
+NODE_RG=$(az aks show -g "$RESOURCE_GROUP" -n "$AKS_NAME" --query nodeResourceGroup -o tsv)
+ALB_PRINCIPAL_ID=$(az identity list -g "$NODE_RG" \
+  --query "[?starts_with(name, 'azurealb-')].principalId | [0]" -o tsv)
+echo "ALB Controller identity: $ALB_PRINCIPAL_ID"
+
+az role assignment create \
+  --assignee-object-id "$ALB_PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Network Contributor" \
+  --scope "$WAF_ID"
+
 # 2. Bind it to our Gateway via the ALB Controller's WebApplicationFirewallPolicy CRD.
 kubectl apply -f - <<EOF
 apiVersion: alb.networking.azure.io/v1
@@ -645,9 +660,18 @@ spec:
     id: $WAF_ID
 EOF
 
-# 3. Confirm the CRD reports the policy as programmed.
-kubectl get webapplicationfirewallpolicy -n $APP_NAMESPACE agc-gateway-waf -o yaml | tail -20
+# 3. Wait for the controller to reconcile, then confirm Programmed=True.
+sleep 30
+kubectl get webapplicationfirewallpolicy -n $APP_NAMESPACE agc-gateway-waf \
+  -o jsonpath='{.status.conditions[?(@.type=="Programmed")]}{"\n"}'
 ```
+
+> **If you applied the CRD before the role assignment** (or had any other permission issue at first reconcile), the controller caches the failure on the CRD. Force a re-reconcile by deleting and re-applying:
+>
+> ```bash
+> kubectl delete webapplicationfirewallpolicy -n $APP_NAMESPACE agc-gateway-waf
+> # then re-run the kubectl apply block above
+> ```
 
 > **If kubectl prints `the server has asked for the client to provide credentials`** \u2014 your Cloud Shell session lost the AKS cluster credentials (common after an idle disconnect). Re-run:
 >
@@ -1021,3 +1045,4 @@ As issues come up running these instructions, the fix is recorded here.
 | 2026-05-04 | `(FeatureNotFound) The feature 'AzureServiceMeshPreview' could not be found.` | That feature doesn't exist and isn't needed for this demo. Step 1 above no longer registers it — only `AdvancedNetworkingPreview` is registered. |
 | 2026-05-04 | In step 5 (cilium monitor), second tab fails with `curl: (49) Couldn't parse CURLOPT_RESOLVE entry 'contoso.example.com:80:'` | Cloud Shell tabs are independent shells — `$IP` and `$APP_NAMESPACE` from tab 1 aren't visible in tab 2. Re-export the variables and re-run `az aks get-credentials` + the FQDN/IP lookup at the top of every new tab. Step 5 above now shows the full re-export. |
 | 2026-05-05 | Step 4a-bonus: `(ApplicationGatewayFirewallManagedRuleSetsHasMultiplePrimaryRuleSets)` after `rule-set add Microsoft_DefaultRuleSet`. | `az ... waf-policy create` forces OWASP 3.x, but AGC WAF only supports DRS 2.1. You can't `remove` OWASP first (`NoValidPrimaryRuleSetsAttached`) and you can't `add` DRS while OWASP is attached. The fix is to swap the entire `managedRuleSets` array atomically with `az ... update --set "managedRules.managedRuleSets=[{...DRS 2.1...}]"`. Step 4a-bonus now uses that pattern. |
+| 2026-05-05 | Step 4a-bonus: CRD stuck in `DeploymentFailed` with `LinkedAuthorizationFailed` / `does not have permission to perform 'microsoft.network/applicationgatewaywebapplicationfirewallpolicies/join/action'`. | The ALB Controller's managed identity (in the AKS node RG, named `azurealb-*`) needs the `join` permission on the WAF policy resource. Grant it `Network Contributor` scoped to the WAF policy. Step 4a-bonus's setup block now does this with `az role assignment create` before applying the CRD. After the role is granted, delete + re-apply the CRD to force the controller off its cached failure. |
