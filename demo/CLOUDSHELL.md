@@ -729,11 +729,11 @@ client->fabrikam     -> 000
 
 **What the output means:**
 
-| Line | Who decided | What happened | What it tells the audience |
-|---|---|---|---|
-| `client->contoso GET -> 200` | nginx | Both `client-may-call-contoso-get-only` (egress on client) AND `allow-agc-l7-get-only` (ingress on contoso) permitted GET → nginx served | **Both ends must agree.** Cilium is enforcing identity-based, bidirectional whitelists. |
-| `client->contoso POST -> 403` | **ACNS** | Cilium L7 proxy parsed HTTP, saw POST, synthesized 403 | Right pod, right port, **wrong method.** A compromised neighbor cannot escalate to dangerous methods even on services it can already reach. |
-| `client->fabrikam -> 000` | **ACNS at L4** | TCP handshake never completed — Cilium silently dropped the SYN | **No policy whitelists `client → fabrikam`.** Default-deny kicks in *before HTTP exists*. From the attacker's perspective, fabrikam might as well not exist. |
+| Line | Who decided | What happened | Why it happened | What it tells the audience |
+|---|---|---|---|---|
+| `client->contoso GET -> 200` | nginx | Both `client-may-call-contoso-get-only` (egress on client) AND `allow-agc-l7-get-only` (ingress on contoso) permitted GET → nginx served | This is the *one* east-west path explicitly allowed: `client` is whitelisted to send `GET /` to `contoso`, and `contoso` is whitelisted to accept `GET /`. Both sides agree, so Cilium passes the request and nginx serves the homepage. | **Both ends must agree.** Cilium is enforcing identity-based, bidirectional whitelists. |
+| `client->contoso POST -> 403` | **ACNS** | Cilium L7 proxy parsed HTTP, saw POST, synthesized 403 | Same source, same destination, same port — only the verb changed. The whitelist between `client` and `contoso` only allows `GET`, so Cilium opens the request, sees `POST`, and synthesizes a `403` itself before the packet reaches contoso. | Right pod, right port, **wrong method.** A compromised neighbor cannot escalate to dangerous methods even on services it can already reach. |
+| `client->fabrikam -> 000` | **ACNS at L4** | TCP handshake never completed — Cilium silently dropped the SYN | There is no policy anywhere that whitelists `client → fabrikam`. Default-deny kicks in at the network layer — Cilium drops the SYN packet before TCP ever connects, so curl can't even start an HTTP request. That's why you see `000` (no HTTP response code) instead of `403`. | **No policy whitelists `client → fabrikam`.** Default-deny kicks in *before HTTP exists*. From the attacker's perspective, fabrikam might as well not exist. |
 
 > **Verdict:** ACNS allowed the one whitelisted call, denied the wrong-method call at L7 with a 403, and denied the unknown-peer call at L4 with a silent drop.
 
