@@ -456,7 +456,7 @@ All 4 should show `VALID=True`.
 
 ### The arc of step 4 in one paragraph
 
-> *The setup phase built two things: an Azure-managed L7 load balancer (AGC) wired to three sample tenants, and a set of Cilium L7 policies (ACNS) clamped down on every pod inside the cluster. Step 4 proves both layers are doing exactly what we said they would. **4a shows AGC doing its only job — routing internet traffic into the cluster.** **4b–4e show ACNS doing its only job — deciding what traffic, from any source, is allowed to flow inside the cluster.** AGC is the front door. ACNS is the security guard at every interior door. The two never overlap, and customers get both for free when they enable the AGC add-on with ACNS L7.*
+> *The setup phase built two things: an Azure-managed L7 load balancer (AGC) wired to three sample tenants, and a set of Cilium L7 policies (ACNS) clamped down on every pod inside the cluster. Step 4 proves both layers are doing exactly what we said they would. **4a shows AGC routing internet traffic into the cluster, then a 4a-bonus lights up Azure WAF on AGC to block OWASP-class attacks at the edge.** **4b–4e show ACNS deciding what traffic, from any source, is allowed to flow inside the cluster.** AGC is the front door (and, with WAF, a metal detector at the front door). ACNS is the security guard at every interior door. The three layers never overlap, and customers get all of them when they enable the AGC add-on with ACNS L7.*
 
 ### How to run each test
 
@@ -476,13 +476,14 @@ Each `### 4x.` subsection has the same shape, intentionally:
 | Tests | Layer being demonstrated | What's enforcing | Direction |
 |---|---|---|---|
 | **4a** Multi-site routing | **AGC** (the front door) | Gateway API `HTTPRoute` hostname matching on the AGC frontend | North-south: internet → cluster |
+| **4a-bonus** SQLi / path-traversal blocked at the edge | **AGC + Azure WAF** (DRS 2.1) | `WebApplicationFirewallPolicy` CRD bound to the Gateway | North-south: internet → AGC (request never reaches the pod) |
 | **4b** GET vs POST/PUT/DELETE, /products vs /admin | **ACNS L7** (the bouncer at the pod door) | `CiliumNetworkPolicy` L7 rules at the contoso/fabrikam/adventure pod | North-south *behind* AGC: AGC → pod |
 | **4c** client → contoso GET/POST, client → fabrikam | **ACNS L7** (east-west, no AGC involved) | Same `CiliumNetworkPolicy` L7 rules, applied to in-cluster pod-to-pod | **East-west: pod ↔ pod** |
 | **4d** Backend pod → bing.com | **ACNS** default-deny egress | `default-deny-all` CNP at the pod | East-west out: pod → internet |
 | **4e** DNS still resolves | **ACNS** carve-out | `allow-dns-egress` CNP | East-west to kube-dns |
 | **5** Live drop monitor | **ACNS** observability | `cilium monitor` reading kernel events | Whichever direction you generate traffic in |
 
-> **One sentence to repeat at the start of step 4:** *"AGC is what brought the request into the cluster — you'll see that work in 4a. From 4b onward, ACNS L7 controls what happens to that request once it's inside the cluster: north-south *behind* AGC (4b), pod-to-pod east-west (4c), and outbound (4d/4e)."*
+> **One sentence to repeat at the start of step 4:** *"AGC is what brought the request into the cluster — you'll see that work in 4a, and you'll see AGC's Azure WAF reject malicious traffic at the edge in 4a-bonus. From 4b onward, ACNS L7 controls what happens to that request once it's inside the cluster: north-south *behind* AGC (4b), pod-to-pod east-west (4c), and outbound (4d/4e)."*
 
 ### Set up the test variables
 
@@ -557,6 +558,131 @@ done
 > **Verdict:** AGC brought traffic in (host-based routing on a single public IP). ACNS allowed it through (`GET /` is in the whitelist).
 
 **The takeaway to repeat to the customer:** *"With one flag at cluster create time and one Gateway+HTTPRoute YAML, AGC gives you a managed multi-tenant L7 frontend that's invisible to your app teams. This is the canonical pattern customers ship to prod."*
+
+### 4a-bonus. Add WAF to AGC — the AGC superpower that ACNS alone can't give you
+
+| Tests | Layer | What's enforcing | Direction |
+|---|---|---|---|
+| **4a-bonus** SQLi / path-traversal payload at the edge | **AGC + Azure WAF** (managed Default Rule Set 2.1) | `WebApplicationFirewallPolicy` CRD → `SecurityPolicy` → Azure WAF policy | North-south: internet → AGC (request never reaches the pod) |
+
+**The story in one line:** AGC isn't *just* a load balancer — turn on one CRD and it becomes a full Azure-managed Web Application Firewall, blocking OWASP-class attacks at the edge before they can reach your pods or your ACNS L7 rules.
+
+**Why this slots into 4a (the AGC half):** WAF is an AGC capability. Customers cannot get Azure WAF on AKS L7 ingress without AGC. So choosing AGC isn't just "managed Gateway API" — it's also "the only path to native Azure WAF for AKS." That's the complete AGC value prop.
+
+**AGC's role here:** **everything** — and a *new* responsibility. So far AGC has been a pure router. Now AGC is also evaluating each request's headers, query string, and body against the Azure-managed Default Rule Set (DRS) 2.1 — SQLi, XSS, RFI, LFI, command injection, the OWASP Top 10. Malicious requests are rejected by AGC at the edge with `403 Forbidden` and never reach the pod.
+
+**ACNS's role here:** *not invoked.* The malicious request dies at AGC. ACNS L7 doesn't get a chance to look at it because the packet never makes it to the pod's network namespace. **This is defense in depth working correctly:** the *outer* layer (AGC WAF) catches what it can, and the *inner* layer (ACNS) is only reached by traffic AGC didn't kill.
+
+**Why it matters that *both* layers exist:**
+
+| Threat | AGC WAF (edge) | ACNS L7 (pod) |
+|---|---|---|
+| `?text=/etc/passwd` path-traversal payload from internet | **Blocks (DRS rule match)** | Wouldn't have triggered (path is `/`, method is GET — passes ACNS) |
+| `POST /` from internet | Forwards (no WAF rule against bare POST) | **Blocks (method not in whitelist)** |
+| `POST /` from a *compromised pod inside the cluster* | Doesn't see it | **Blocks (4c will prove this)** |
+| Zero-day SQLi against `/products?id=...` | **Blocks (DRS pattern match)** | Wouldn't catch (path is allowed) |
+
+**One product cannot do both.** AGC WAF protects against signature-based attacks coming from the internet. ACNS L7 protects against *behavioral* misuse from any source — inside or outside. Customers need both, and the AGC add-on bundles both into one onboarding step.
+
+**Talking points** (read out loud while you're typing the WAF setup):
+
+- "Step back. So far we've shown AGC routing and ACNS enforcement. Now we're going to light up the third leg of the stool: **AGC's built-in Azure Web Application Firewall.**"
+- "The bridge sentence I want the audience to remember: **WAF is what AGC unlocks for ACNS customers.** You can't get Azure WAF on AKS L7 ingress without AGC — there's no DIY ingress controller path to it. So choosing AGC for managed Gateway API gets you native WAF basically for free."
+- "WAF on AGC uses the Azure-managed Default Rule Set 2.1 — same OWASP-class signatures as Front Door / standalone App Gateway WAF. SQL injection, XSS, RFI, LFI, command injection, scanner detection."
+- "The wiring is two pieces: an Azure-side `Microsoft.Network/ApplicationGatewayWebApplicationFirewallPolicies` resource that holds the rules, and a Kubernetes-side `WebApplicationFirewallPolicy` CRD that points the ALB Controller at it. The CRD `targetRef` lets you scope WAF to the entire `Gateway`, a specific listener, or a specific `HTTPRoute`. We'll scope to the whole Gateway so all three tenants are protected at once."
+- "Watch the response code. `200` for the legit request, `403` for the malicious one — and the 403 here is from **AGC**, not from Cilium. Same status code as 4b's ACNS denials, but a completely different layer of defense."
+- "After this test, we go back to ACNS in 4b. The point of 4a-bonus is to show the **complete** AGC story before we hand off to ACNS for everything inside the cluster."
+
+**Setup — create the Azure WAF policy and bind it via the CRD:**
+
+```bash
+# 1. Create the Azure WAF policy with DRS 2.1 (the only managed ruleset AGC WAF supports).
+az network application-gateway waf-policy create \
+  --name agc-waf-policy \
+  --resource-group $RG \
+  --location $LOCATION \
+  --type OWASP --version 3.2
+
+az network application-gateway waf-policy managed-rule rule-set add \
+  --policy-name agc-waf-policy --resource-group $RG \
+  --type Microsoft_DefaultRuleSet --version 2.1
+
+az network application-gateway waf-policy update \
+  --name agc-waf-policy --resource-group $RG \
+  --set policySettings.mode=Prevention policySettings.state=Enabled
+
+WAF_ID=$(az network application-gateway waf-policy show \
+  --name agc-waf-policy --resource-group $RG --query id -o tsv)
+echo "$WAF_ID"
+
+# 2. Bind it to our Gateway via the ALB Controller's WebApplicationFirewallPolicy CRD.
+kubectl apply -f - <<EOF
+apiVersion: alb.networking.azure.io/v1
+kind: WebApplicationFirewallPolicy
+metadata:
+  name: agc-gateway-waf
+  namespace: $APP_NAMESPACE
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: gateway-01
+    namespace: $APP_NAMESPACE
+  webApplicationFirewall:
+    id: $WAF_ID
+EOF
+
+# 3. Confirm the CRD reports the policy as programmed.
+kubectl get webapplicationfirewallpolicy -n $APP_NAMESPACE agc-gateway-waf -o yaml | tail -20
+```
+
+**Expected setup output:**
+
+```text
+/subscriptions/.../resourceGroups/5-4-agc-demo/providers/Microsoft.Network/applicationGatewayWebApplicationFirewallPolicies/agc-waf-policy
+webapplicationfirewallpolicy.alb.networking.azure.io/agc-gateway-waf created
+...
+status:
+  conditions:
+  - reason: Programmed
+    status: "True"
+    type: Programmed
+```
+
+**Now run the actual test — one benign request, one malicious:**
+
+```bash
+# Benign — should still get 200 from contoso (proves WAF doesn't break good traffic).
+curl -s -o /dev/null -w "benign      GET /                       -> %{http_code}\n" \
+  --resolve contoso.example.com:80:$IP http://contoso.example.com/
+
+# Malicious — path-traversal payload in query string. DRS 2.1 will match.
+curl -s -o /dev/null -w "malicious   GET /?text=/etc/passwd      -> %{http_code}\n" \
+  --resolve contoso.example.com:80:$IP "http://contoso.example.com/?text=/etc/passwd"
+
+# Malicious — classic SQLi tautology. DRS 2.1 will match.
+curl -s -o /dev/null -w "malicious   GET /?id=1%20OR%201=1       -> %{http_code}\n" \
+  --resolve contoso.example.com:80:$IP "http://contoso.example.com/?id=1%20OR%201=1"
+```
+
+**Expected output:**
+
+```text
+benign      GET /                       -> 200
+malicious   GET /?text=/etc/passwd      -> 403
+malicious   GET /?id=1 OR 1=1           -> 403
+```
+
+**What it proves:**
+
+- **The 200 proves WAF didn't break the app.** Same hostname, same path, same `GET /` we ran in 4a — still works. WAF is surgical, not blunt.
+- **The two 403s came from AGC, not from Cilium.** That's the moneyshot. ACNS L7 wouldn't have caught either of these — both are GETs to `/`, which ACNS's whitelist allows. Without WAF at the edge, both malicious requests would have *reached the pod* and been served by nginx (which would have either ignored the query string or, in a real app, been compromised by it).
+- **Defense in depth is real here.** AGC WAF caught the *signature-based* attack at the edge. ACNS L7 (in 4b) catches the *behavioral* attack (wrong method/path) at the pod. Two different layers, two different rule philosophies, both running automatically.
+- **Operationally, WAF lives in Prevention mode for production and Detection mode for tuning.** One CLI flag flips between them. You can also scope WAF to a single `HTTPRoute` to roll it out per-tenant.
+
+> **Verdict:** AGC brought traffic in **and stopped malicious traffic at the edge** with Azure WAF (DRS 2.1). ACNS never had to look at the request because it died one layer earlier. This is exactly the *outer-perimeter / inner-perimeter* separation customers want.
+
+**The takeaway to repeat to the customer:** *"With AGC you don't choose between 'managed L7 ingress' and 'WAF' — you get both. The Kubernetes-native API surface (`WebApplicationFirewallPolicy` CRD) means your platform team can roll WAF out per-route, per-listener, or cluster-wide without touching Azure portals. And every request that AGC WAF lets through is then re-inspected by ACNS at the pod for HTTP method, path, and source identity. That's defense in depth in two YAMLs."*
 
 ### 4b. ACNS L7 — deciding what traffic is *allowed* once it's inside
 
