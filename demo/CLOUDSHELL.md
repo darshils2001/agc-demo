@@ -31,15 +31,29 @@ Hands-on-keyboard runbook. Paste each block into **Azure Cloud Shell** (<https:/
 
 ## 1. Set up Azure (variables, providers, AKS cluster, WAF policy)
 
-**Talking points (read before running):**
+**What this block does, at a glance:**
 
-- One block does all the Azure-side work: set variables, register providers and the L7 preview feature, install CLI extensions, create the RG, create the AKS cluster with both add-ons, fetch kubeconfig, and create the WAF policy + role assignment for the ALB Controller.
-- **The two flags that make this demo possible:** `--enable-acns --acns-advanced-networkpolicies L7` turns on Cilium L7 (HTTP-aware policy — method, path, headers); `--enable-application-load-balancer` installs the **AGC** add-on (controller, workload identity, delegated subnet, all auto-provisioned). Without those two, none of step 4 works.
-- Supporting flags: Azure CNI Overlay + Cilium dataplane (required for L7), Gateway API CRDs, OIDC issuer + workload identity (so AGC talks to ARM with no secrets), 2× `Standard_D4s_v5` nodes, SSH disabled.
-- **`AdvancedNetworkingPreview`** is the preview flag that gates the L7 capability — without it, `--acns-advanced-networkpolicies L7` is rejected. The four resource providers (`ContainerService`, `Network`, `ServiceNetworking`, `OperationsManagement`) cover AKS, VNets, the AGC backend, and ACNS telemetry.
-- **WAF is created up front** so we can attach it once the Gateway exists in step 2. WAF on AGC uses the managed **Default Rule Set 2.1** — same OWASP-class signatures as Front Door and standalone App Gateway WAF. The "create with OWASP, atomically swap to DRS 2.1" dance is a CLI quirk: `waf-policy create` requires `--type/--version` and only accepts OWASP, but AGC WAF only supports DRS 2.1, so we swap the entire `managedRuleSets` array (and set Prevention/Enabled) in one update.
-- **The role assignment** grants the ALB Controller's managed identity `Network Contributor` on the WAF policy. The controller needs this to `join` the policy from the Kubernetes side; without it the WAF CRD sits in `LinkedAuthorizationFailed`. The MI naming varies across add-on versions (`applicationloadbalancer-<aks>` for GA, `azurealb-<aks>` for older preview), so we match either.
-- Cluster create takes ~7 minutes. Everything else in this block is fast.
+One pasteable bash block stands up the entire Azure side of the demo:
+
+1. Sets variables and picks the subscription.
+2. Registers providers + the L7 preview feature, installs the `aks-preview` and `alb` CLI extensions.
+3. Creates the resource group and the AKS cluster (~7 min).
+4. Creates the Azure WAF policy and grants the ALB Controller permission to attach it.
+
+When this finishes, you have an empty AKS cluster with both add-ons installed and a WAF policy waiting on the side, ready to be bound in step 2.
+
+**The two flags that make this whole demo possible** — the rest is supporting cast:
+
+- `--enable-acns --acns-advanced-networkpolicies L7` → turns on **Cilium L7** (HTTP-aware policy: method, path, headers). This is what makes 4b–4e work.
+- `--enable-application-load-balancer` → installs the **AGC** add-on (controller, workload identity, delegated subnet — all auto-provisioned). This is what makes 4a possible.
+
+**Three things worth knowing** while the cluster builds:
+
+- **L7 is preview-gated.** `AdvancedNetworkingPreview` must be registered or the L7 flag above is rejected. The four resource providers cover AKS, VNets, the AGC backend (`ServiceNetworking`), and ACNS telemetry.
+- **WAF gets a CLI dance.** AGC WAF only supports DRS 2.1, but `waf-policy create` only accepts OWASP. We create with OWASP, then atomically swap the rule set to DRS 2.1 (and flip to Prevention/Enabled) in one update. The bash handles this for you.
+- **The role assignment is mandatory.** The ALB Controller's managed identity needs `Network Contributor` on the WAF policy to attach it from the Kubernetes side. Without it, the WAF CRD fails with `LinkedAuthorizationFailed`. The MI naming varies by add-on version (`applicationloadbalancer-*` for GA, `azurealb-*` for older preview), so the script matches either.
+
+Cluster create is the only slow step (~7 min). Everything else is fast.
 
 ```bash
 # --- Variables (edit as needed) ---
@@ -114,22 +128,34 @@ You should see 2 Ready nodes, 2 Running `alb-controller` pods, `azure-alb-extern
 
 ## 2. Apply all Kubernetes manifests (cluster contents + WAF binding)
 
-**Talking points (read before running):**
+**What this block does, at a glance:**
 
-This single `kubectl apply` lays down every Kubernetes object the demo needs. Read it as **six layers**, applied as one block:
+One `kubectl apply` lays down every Kubernetes object the demo needs. Read the manifest as **six layers** stacked on top of each other:
 
-1. **Two namespaces** — `$ALB_NAMESPACE` (platform team owns the AGC frontend intent) and `$APP_NAMESPACE` (app team owns workloads + policies). The split mirrors the ownership boundary AGC docs recommend.
-2. **`ApplicationLoadBalancer` CR** — the *declaration of intent* that triggers AGC. The empty `associations: []` is the magic incantation for **managed-by-ALB** mode: AKS carves a `/24` subnet, delegates it to `Microsoft.ServiceNetworking/TrafficController`, provisions the AGC Azure resource in the `MC_` group, associates the subnet, and federates the controller's identity. **Customer wrote 7 lines of YAML; AKS produced an Azure load balancer.**
-3. **Three sample tenants + a client pod** — three nginx pods (contoso/fabrikam/adventure) listening on 8080 with site-specific HTML so we can prove from the response which backend served. Labels `site: <name>` are what the L7 policy in layer 5 matches on. The `client` curl pod is for east-west enforcement in 4c.
-4. **Gateway + 3 HTTPRoutes** — one `Gateway` on port 80 (annotations link it to the ALB CR by name), three `HTTPRoute`s binding `<site>.example.com` to each backend Service. **One Gateway, one public IP, three sites.** Adding a fourth tenant is one more HTTPRoute. We don't own these hostnames; we'll forge `Host:` with `curl --resolve` later.
-5. **Four `CiliumNetworkPolicy` objects (the L7 lockdown)** — additive whitelists on top of default-deny:
-   - `default-deny-all` — every pod in `$APP_NAMESPACE` denies all ingress + egress. Nothing works after this alone (intentional). Note `ingress: [{}]` (one empty rule) not `ingress: []` (no rule) — that's the syntax tell for "deny everything."
-   - `allow-dns-egress` — the survival kit. Lets pods talk to kube-dns on 53; Cilium parses the DNS query at L7 (`matchPattern: "*"` allows any name). Without this, layers 3–5 work but apps can't find each other by name.
-   - `allow-agc-l7-get-only` — north-south allow. Pods labelled `site ∈ {contoso,fabrikam,adventure}` accept inbound 8080 from `world` **and** `cluster`, but only `GET /` and `GET /products`. Anything else gets a Cilium-synthesized 403 *before nginx sees it*. (Both `world` and `cluster` are listed because AGC traffic enters via a node-local hop tagged `cluster`, not `world` — caught us during build.)
-   - `client-may-call-contoso-get-only` — east-west allow. `app:client` may call `app:contoso` on `GET /` only. Both this AND `allow-agc-l7-get-only` must permit the call (Cilium policies are additive — source's egress and destination's ingress must agree).
-6. **`WebApplicationFirewallPolicy` CRD** — the Kubernetes-side binding that points the ALB Controller at the Azure WAF policy created in step 1 (via `$WAF_ID`). Scoped Gateway-wide so all three tenants are protected. Operational shape: WAF runs **Prevention** for prod, **Detection** for tuning — one CLI flag flips between them. Can be scoped per-`HTTPRoute` for per-tenant rollout.
+| # | Layer | What it does |
+|---|---|---|
+| 1 | **Two namespaces** | `$ALB_NAMESPACE` for the AGC frontend intent (platform team), `$APP_NAMESPACE` for workloads + policies (app team). Mirrors the ownership boundary AGC docs recommend. |
+| 2 | **`ApplicationLoadBalancer` CR** | The *declaration of intent* that makes AGC come into existence. Empty `associations: []` = managed-by-ALB mode → AKS auto-creates the subnet, AGC resource, and workload-identity federation. **7 lines of YAML → a real Azure load balancer.** |
+| 3 | **3 nginx tenants + 1 client pod** | Each tenant has site-specific HTML so 4a can prove which backend served the response. The `client` curl pod is for east-west tests in 4c. The `site:<name>` label is what Cilium policies match on. |
+| 4 | **Gateway + 3 HTTPRoutes** | One Gateway on port 80, three `HTTPRoute`s binding `<site>.example.com` to each backend. **One public IP, three sites.** Adding a 4th tenant is one more HTTPRoute. |
+| 5 | **4 `CiliumNetworkPolicy` objects** | The L7 lockdown. Additive whitelists on top of default-deny. *Detail below.* |
+| 6 | **`WebApplicationFirewallPolicy` CRD** | The Kubernetes-side binding that attaches the WAF policy from step 1 to the Gateway. Scoped Gateway-wide → all three tenants protected. |
 
-After this applies, we wait for two things: the ALB CR to reach `Deployment=True` (AGC frontend provisioned, ~5 min) and the WAF CRD to reach `Programmed=True` (WAF live on the Gateway). When both are true, the demo is ready.
+**The four Cilium policies, in plain English:**
+
+1. **`default-deny-all`** — turn off the cluster. Every pod in `$APP_NAMESPACE` denies all ingress + egress. Nothing works after this alone (intentional). *Syntax tell:* `ingress: [{}]` (one empty rule = deny-all) ≠ `ingress: []` (no rule = no-op).
+2. **`allow-dns-egress`** — turn DNS back on. Without it, the apps work but can't find each other.
+3. **`allow-agc-l7-get-only`** — the **north-south** allow. The three tenant pods accept inbound 8080, but only `GET /` and `GET /products`. Anything else gets a Cilium-synthesized 403 *before nginx sees it*. (Both `world` and `cluster` are listed as sources because AGC traffic enters via a node-local hop tagged `cluster`, not `world` — caught us during build.)
+4. **`client-may-call-contoso-get-only`** — the **east-west** allow. `client` may call `contoso` on `GET /` only. Cilium policies are additive: both source-egress AND destination-ingress must permit, which is why 4c shows three different verdicts (`200`, `403`, `000`) for three different policy interactions.
+
+**Operational note on WAF:** runs in **Prevention** for prod, **Detection** for tuning — one CLI flag flips between them. Can also be scoped per-`HTTPRoute` for per-tenant rollout.
+
+**After applying, we wait for two green lights:**
+
+- ALB CR reaches `Deployment=True` (AGC frontend provisioned, ~5 min).
+- WAF CRD reaches `Programmed=True` (WAF live on the Gateway).
+
+When both are true, the demo is ready.
 
 ```bash
 kubectl apply -f - <<EOF
