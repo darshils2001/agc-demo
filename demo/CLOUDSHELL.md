@@ -13,6 +13,7 @@ Hands-on-keyboard runbook. Paste each block into **Azure Cloud Shell** (<https:/
 **Talking points:**
 - Set these to whatever subscription / region / resource group / cluster name you're using. The values below are placeholders — swap them for your own. The rest of the runbook references these variables, so you only edit them once here.
 - Pick a region where AGC is generally available and your subscription has capacity for a small AKS cluster. AGC is multi-region; if a particular region returns transient `Microsoft.ServiceNetworking` errors during AGC subnet association, switch regions and retry. The AGC controller will surface these errors clearly in `az network alb association list`.
+- **Region note from this build:** `westus3` was reliable end-to-end; `eastus2` hit transient AGC subnet-association errors during provisioning. If `kubectl wait` on the `ApplicationLoadBalancer` in 3b sits at `Updating` for >10 min, that's the signature — switch regions.
 - Two namespaces: `$ALB_NAMESPACE` holds the AGC `ApplicationLoadBalancer` CR (the AGC frontend's intent lives here), `$APP_NAMESPACE` holds the workloads + Cilium policies. This split mirrors the ownership boundary we recommend in AGC docs — platform team owns the ALB namespace, app team owns the workload namespace.
 
 
@@ -66,7 +67,7 @@ az group create -n "$RESOURCE_GROUP" -l "$LOCATION"
 - `--network-plugin azure --network-plugin-mode overlay` — pods get IPs from a non-routable overlay (`10.244.0.0/16`), which keeps the VNet plan small. Pod-to-pod still works directly because Cilium handles encapsulation.
 - `--network-dataplane cilium` — replaces kube-proxy/iptables with Cilium's eBPF dataplane. Required for L7 enforcement; Azure NPM can't do L7.
 - `--enable-acns --acns-advanced-networkpolicies L7` — turns on **Advanced Container Networking Services** in L7 mode. This is what makes Cilium understand HTTP method/path/header rules — not just port rules.
-- `--enable-application-load-balancer` — installs the **AGC add-on**: two `alb-controller` pods in `kube-system`. They watch Gateway API objects in the cluster and translate them into AGC config in Azure.
+- `--enable-application-load-balancer` — installs the **AGC add-on**: two `alb-controller` pods in `kube-system`. They watch Gateway API objects in the cluster and translate them into AGC config in Azure. **AKS owns the controller image, the workload-identity federation, the delegated subnet (`aks-appgateway` in the `MC_*` RG), and the AGC resource itself.** No Helm chart, no manual identity glue. The trade-off worth saying out loud: you can't customize the controller image — if a customer needs a fork, they can't use the managed add-on.
 - `--enable-gateway-api` — installs the upstream Gateway API CRDs (`Gateway`, `HTTPRoute`, `GatewayClass`) and registers `azure-alb-external` as the implementing GatewayClass.
 - `--enable-oidc-issuer --enable-workload-identity` — required so AGC's controller can authenticate to Azure as a workload identity (no client secrets, no service principal handoff).
 - `Standard_D4s_v5 x 2` — modest size; the demo doesn't need more. SSH disabled because we don't ever shell into the nodes.
@@ -313,6 +314,7 @@ done
 - One `Gateway` (`gateway-01`) with a single HTTP listener on port 80. The annotations `alb-namespace` and `alb-name` link it to the `ApplicationLoadBalancer` we created in 3b — that's how the controller knows *which* AGC resource to program with this Gateway.
 - Three `HTTPRoute`s, each binding a different hostname (`contoso.example.com`, `fabrikam.example.com`, `adventure.example.com`) to a different backend Service. **One Gateway, one public IP, three sites.** Adding a fourth site is just another HTTPRoute — no Azure-side changes.
 - We don't actually own those hostnames; we'll use `curl --resolve` later to forge the Host header. In a real deployment you'd point DNS A/AAAA records at the AGC FQDN.
+- **Cross-namespace caveat for prod:** in this demo Routes and Services live in the same namespace, so we don't need a `ReferenceGrant`. In a real multi-tenant setup where the `HTTPRoute` lives in a tenant namespace and the backend `Service` lives elsewhere, you must add a `ReferenceGrant` in the Service's namespace permitting that Route to refer across the boundary. Mention this when customers ask about the multi-team ownership model.
 - `Programmed=True` is the condition that says AGC has finished applying our Gateway config to the data plane. After that, the FQDN actually serves traffic.
 
 ```bash
@@ -982,7 +984,7 @@ Address: 10.0.37.14
 
 - "This is the same enforcement layer you saw in 4b–4e. Now you're watching it from the kernel's perspective in real time."
 - "It's eBPF, in-kernel, identity-based. The event isn't 'IP X talked to IP Y' — it's 'identity *client* in namespace *agc-sites* tried to POST to identity *contoso*, verdict DENIED.'"
-- "This is the same data stream that feeds Hubble, Container Insights, and Azure Monitor for AKS. You're seeing the source of truth."
+- "This is the same data stream that feeds **Hubble** and Hubble UI, **Container Insights**, and **Azure Monitor for AKS**. You're seeing the source of truth — every aggregated dashboard is downstream of this exact event ring buffer."
 - "Customers love this for two reasons: (1) it makes 'L7 policy' tangible — they can see real HTTP method strings — and (2) it proves the enforcement is happening at the dataplane, not in some cloud-side log aggregator that runs minutes behind."
 - "Operationally, this is also how you'd debug a misbehaving allow rule: tail the monitor, generate the request, see exactly which rule made the decision."
 
@@ -1059,24 +1061,15 @@ az group delete -n "$RESOURCE_GROUP" --yes --no-wait
 
 ---
 
-## Notes for Cloud Shell specifically
+## Q&A reference links (for live demo)
 
-- **Session timeouts**: Cloud Shell idle-disconnects after 20 min. If you come back later, just re-run the variable block (step 0) and `az aks get-credentials` to reattach.
-- **Variables don't persist** across sessions. If you reconnect, paste step 0 again before doing anything else.
-- **No `python` quirks**: Cloud Shell's `getent hosts` works fine.
-- **Storage**: Cloud Shell mounts a persistent `~/clouddrive` if you want to save these snippets to a file.
+Keep this section open in another tab during Q&A.
 
----
+- AKS + Cilium L7 policies — <https://learn.microsoft.com/azure/aks/how-to-apply-l7-policies> (`aka.ms/aks/l7-policies`)
+- AGC ALB Controller add-on quickstart — <https://learn.microsoft.com/azure/application-gateway/for-containers/quickstart-deploy-application-gateway-for-containers-alb-controller-addon>
+- AGC multi-site hosting (Gateway API) — <https://learn.microsoft.com/azure/application-gateway/for-containers/how-to-multiple-site-hosting-gateway-api>
+- AGC components / connectivity / egress — <https://learn.microsoft.com/azure/application-gateway/for-containers/application-gateway-for-containers-components#connectivity>
+- Azure WAF on AGC — <https://learn.microsoft.com/azure/application-gateway/for-containers/web-application-firewall-overview>
+- Cilium HTTP-aware policy spec — <https://docs.cilium.io/en/stable/security/policy/language/#http>
+- **Customer-facing self-service version of this demo:** <https://github.com/darshils2001/agc-l7-workshop>
 
-## Errata / fixes (running list)
-
-As issues come up running these instructions, the fix is recorded here.
-
-| Date | Symptom | Fix |
-| --- | --- | --- |
-| 2026-05-04 | `(FeatureNotFound) The feature 'AzureServiceMeshPreview' could not be found.` | That feature doesn't exist and isn't needed for this demo. Step 1 above no longer registers it — only `AdvancedNetworkingPreview` is registered. |
-| 2026-05-04 | In step 5 (cilium monitor), second tab fails with `curl: (49) Couldn't parse CURLOPT_RESOLVE entry 'contoso.example.com:80:'` | Cloud Shell tabs are independent shells — `$IP` and `$APP_NAMESPACE` from tab 1 aren't visible in tab 2. Re-export the variables and re-run `az aks get-credentials` + the FQDN/IP lookup at the top of every new tab. Step 5 above now shows the full re-export. |
-| 2026-05-05 | Step 4a-bonus: `(ApplicationGatewayFirewallManagedRuleSetsHasMultiplePrimaryRuleSets)` after `rule-set add Microsoft_DefaultRuleSet`. | `az ... waf-policy create` forces OWASP 3.x, but AGC WAF only supports DRS 2.1. You can't `remove` OWASP first (`NoValidPrimaryRuleSetsAttached`) and you can't `add` DRS while OWASP is attached. The fix is to swap the entire `managedRuleSets` array atomically with `az ... update --set "managedRules.managedRuleSets=[{...DRS 2.1...}]"`. Step 4a-bonus now uses that pattern. |
-| 2026-05-05 | Step 4a-bonus: CRD stuck in `DeploymentFailed` with `LinkedAuthorizationFailed` / `does not have permission to perform 'microsoft.network/applicationgatewaywebapplicationfirewallpolicies/join/action'`. | The ALB Controller's managed identity (in the AKS node RG, named `azurealb-*`) needs the `join` permission on the WAF policy resource. Grant it `Network Contributor` scoped to the WAF policy. Step 4a-bonus's setup block now does this with `az role assignment create` before applying the CRD. After the role is granted, delete + re-apply the CRD to force the controller off its cached failure. |
-| 2026-05-05 | Step 4a-bonus 1e: `ALB Controller identity:` prints empty, then `az role assignment create` fails with `usage error: --assignee STRING \| --assignee-object-id GUID`. | The ALB Controller identity in the GA add-on is named `applicationloadbalancer-<aks>` (e.g. `applicationloadbalancer-agcdemo-aks`), not `azurealb-*`. The earlier filter `contains(name, 'alb')` doesn't match because the substring `alb` doesn't appear in `applicationloadbalancer`. Step 1e now matches `starts_with(name, 'applicationloadbalancer')` OR `starts_with(name, 'azurealb')`, prints the full identity table for visibility, and includes a manual-override fallback. |
-| 2026-05-05 | Re-running step 4a-bonus on a cluster where the WAF policy already exists fails at step 1a with `(ApplicationGatewayFirewallAttachAGCUnsupportedRuleSetVersion) RuleSet Version is not supported on Application Gateway for Containers resources`. | `az ... waf-policy create` is an upsert — on a re-run it tries to set `--type OWASP --version 3.2` on the already-attached policy, which AGC rejects (only DRS 2.1 is supported). Step 1a is now wrapped in `if ! az ... waf-policy show ...; then create; fi` so it's a no-op on re-runs. The `update --set` calls in 1b/1c are already idempotent. |
