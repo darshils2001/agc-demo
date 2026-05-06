@@ -716,6 +716,16 @@ status:
 
 **Now run the actual test — one benign request, one malicious:**
 
+> **If you're in a fresh Cloud Shell tab**, re-export `$APP_NAMESPACE` and re-derive `$IP` first, otherwise curl returns `000` (no DNS / empty `--resolve`):
+>
+> ```bash
+> export APP_NAMESPACE="agc-sites"
+> FQDN=$(kubectl get gateway gateway-01 -n $APP_NAMESPACE -o jsonpath='{.status.addresses[0].value}')
+> IP=$(getent hosts "$FQDN" | awk '{print $1}' | head -1)
+> [ -z "$IP" ] && IP=$(dig +short "$FQDN" | head -1)
+> echo "FQDN=$FQDN  IP=$IP"
+> ```
+
 ```bash
 # Benign — should still get 200 from contoso (proves WAF doesn't break good traffic).
 curl -s -o /dev/null -w "benign      GET /                       -> %{http_code}\n" \
