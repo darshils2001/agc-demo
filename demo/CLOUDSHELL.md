@@ -595,22 +595,34 @@ done
 
 **Setup — create the Azure WAF policy and bind it via the CRD:**
 
+> **Why we use a single atomic `update --set managedRules...`:** AGC WAF *only* supports `Microsoft_DefaultRuleSet` (DRS) 2.1 — no OWASP, no Bot Manager. But `az ... waf-policy create` requires `--type/--version` and only accepts OWASP. You cannot fix this with two separate calls (`remove OWASP` then `add DRS`) because:
+> - `remove OWASP` fails with `NoValidPrimaryRuleSetsAttached` (a policy must always have one primary ruleset)
+> - `add DRS` fails with `HasMultiplePrimaryRuleSets` (can't add a second one)
+>
+> So we create with the forced OWASP, then **swap the entire `managedRuleSets` array atomically** in a single `update`.
+
 ```bash
-# 1. Create the Azure WAF policy with DRS 2.1 (the only managed ruleset AGC WAF supports).
-#    Note: --type/--version on `create` only accept OWASP/3.2; DRS 2.1 is added separately below.
+# 1a. Create the policy. --type/--version are required by the CLI; we'll swap the ruleset next.
 az network application-gateway waf-policy create \
   --name agc-waf-policy \
   --resource-group "$RESOURCE_GROUP" \
   --location "$LOCATION" \
   --type OWASP --version 3.2
 
-az network application-gateway waf-policy managed-rule rule-set add \
-  --policy-name agc-waf-policy --resource-group "$RESOURCE_GROUP" \
-  --type Microsoft_DefaultRuleSet --version 2.1
+# 1b. Atomically replace OWASP 3.2 with DRS 2.1 (the only ruleset AGC WAF supports) in one update.
+az network application-gateway waf-policy update \
+  --name agc-waf-policy --resource-group "$RESOURCE_GROUP" \
+  --set "managedRules.managedRuleSets=[{\"ruleSetType\":\"Microsoft_DefaultRuleSet\",\"ruleSetVersion\":\"2.1\",\"ruleGroupOverrides\":[]}]"
 
+# 1c. Set the policy to Prevention/Enabled.
 az network application-gateway waf-policy update \
   --name agc-waf-policy --resource-group "$RESOURCE_GROUP" \
   --set policySettings.mode=Prevention policySettings.state=Enabled
+
+# 1d. Sanity check — should show only Microsoft_DefaultRuleSet 2.1.
+az network application-gateway waf-policy show \
+  --name agc-waf-policy --resource-group "$RESOURCE_GROUP" \
+  --query 'managedRules.managedRuleSets'
 
 WAF_ID=$(az network application-gateway waf-policy show \
   --name agc-waf-policy --resource-group "$RESOURCE_GROUP" --query id -o tsv)
@@ -1008,3 +1020,4 @@ As issues come up running these instructions, the fix is recorded here.
 | --- | --- | --- |
 | 2026-05-04 | `(FeatureNotFound) The feature 'AzureServiceMeshPreview' could not be found.` | That feature doesn't exist and isn't needed for this demo. Step 1 above no longer registers it — only `AdvancedNetworkingPreview` is registered. |
 | 2026-05-04 | In step 5 (cilium monitor), second tab fails with `curl: (49) Couldn't parse CURLOPT_RESOLVE entry 'contoso.example.com:80:'` | Cloud Shell tabs are independent shells — `$IP` and `$APP_NAMESPACE` from tab 1 aren't visible in tab 2. Re-export the variables and re-run `az aks get-credentials` + the FQDN/IP lookup at the top of every new tab. Step 5 above now shows the full re-export. |
+| 2026-05-05 | Step 4a-bonus: `(ApplicationGatewayFirewallManagedRuleSetsHasMultiplePrimaryRuleSets)` after `rule-set add Microsoft_DefaultRuleSet`. | `az ... waf-policy create` forces OWASP 3.x, but AGC WAF only supports DRS 2.1. You can't `remove` OWASP first (`NoValidPrimaryRuleSetsAttached`) and you can't `add` DRS while OWASP is attached. The fix is to swap the entire `managedRuleSets` array atomically with `az ... update --set "managedRules.managedRuleSets=[{...DRS 2.1...}]"`. Step 4a-bonus now uses that pattern. |
