@@ -751,7 +751,7 @@ client->fabrikam     -> 000
 
 - **This is the egress story.** Inbound is only half of zero-trust. The other half is: *if a pod gets compromised, can it phone home?* That's what we're testing.
 - **Why egress matters so much.** Almost every modern Kubernetes attack ends the same way — the compromised pod calls out. Data exfiltration, downloading a second-stage payload, beaconing to a command-and-control server. If you cut egress, you break the attack chain even after the pod is owned.
-- **Who's enforcing this.** AGC has nothing to do with outbound traffic — it only knows about requests coming in. ACNS owns this dimension entirely. The `default-deny-all` CiliumNetworkPolicy says *no pod talks to anything by default*, and we've only carved out two exceptions: DNS (so pods can resolve names) and the specific contoso → fabrikam call from 4c.
+- **Who's enforcing this.** ACNS owns this dimension entirely. The `default-deny-all` CiliumNetworkPolicy says *no pod talks to anything by default*, and we've only carved out two exceptions: DNS (so pods can resolve names) and the specific contoso → fabrikam call from 4c.
 - **Why "silent" matters.** Cilium drops the connection at the kernel — no TCP reset, no ICMP unreachable, no helpful error. The pod just hangs until it times out. To an attacker this looks like a network black hole, which is itself a defense — they can't tell if the destination is blocked, down, or doesn't exist.
 
 ```bash
