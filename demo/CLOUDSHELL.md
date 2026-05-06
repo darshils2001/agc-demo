@@ -128,7 +128,7 @@ We're standing up a fake "shared cluster" that hosts three businesses. They're s
 
 | Pod | Hostname | Role in the demo |
 |---|---|---|
-| **`contoso`** | `contoso.example.com` | The "main" tenant. Every step 4 test hits contoso \u2014 routing, WAF payloads, L7 method/path enforcement, east-west calls. |
+| **`contoso`** | `contoso.example.com` | Our headline tenant. Pretty much every demo step lands on contoso \u2014 it's the one we route to in 4a, the target WAF inspects in 4a-bonus, the pod we send `GET` and `POST` against in 4b, the destination of the east-west call in 4c, and the pod we exec into for 4d and 4e. |
 | **`fabrikam`** | `fabrikam.example.com` | Second tenant. Used in 4a to prove multi-site routing (different `<h1>` in the response), and in 4c as the *unwhitelisted* east-west target (the `000` case). |
 | **`adventure`** | `adventure.example.com` | Third tenant. Used only in 4a multi-site routing. Proves "adding a 3rd tenant is one more HTTPRoute, zero Azure-side work." |
 | **`client`** | *(no hostname \u2014 in-cluster only)* | A `curlimages/curl` pod that just sleeps. Step 4c `kubectl exec`s into it to make pod-to-pod calls without going through AGC. This is how we demo east-west enforcement. |
