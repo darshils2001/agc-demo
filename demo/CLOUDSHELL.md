@@ -128,6 +128,25 @@ You should see 2 Ready nodes, 2 Running `alb-controller` pods, `azure-alb-extern
 
 ## 2. Apply all Kubernetes manifests (cluster contents + WAF binding)
 
+**Meet the cast — three sample tenants and a snooping client:**
+
+We're standing up a fake "shared cluster" that hosts three businesses. They're stock Microsoft sample names you'll see in any Azure demo:
+
+| Pod | Hostname | Role in the demo |
+|---|---|---|
+| **`contoso`** | `contoso.example.com` | The "main" tenant. Every step 4 test hits contoso \u2014 routing, WAF payloads, L7 method/path enforcement, east-west calls. |
+| **`fabrikam`** | `fabrikam.example.com` | Second tenant. Used in 4a to prove multi-site routing (different `<h1>` in the response), and in 4c as the *unwhitelisted* east-west target (the `000` case). |
+| **`adventure`** | `adventure.example.com` | Third tenant. Used only in 4a multi-site routing. Proves "adding a 3rd tenant is one more HTTPRoute, zero Azure-side work." |
+| **`client`** | *(no hostname \u2014 in-cluster only)* | A `curlimages/curl` pod that just sleeps. Step 4c `kubectl exec`s into it to make pod-to-pod calls without going through AGC. This is how we demo east-west enforcement. |
+
+Each tenant is one nginx pod listening on **port 8080** with site-specific HTML (`Hello from Contoso`, etc.) so we can read the response body and prove which backend served it. We don't actually own `*.example.com` \u2014 step 4 forges the `Host:` header with `curl --resolve $IP`.
+
+**Things to remember when you're running step 4:**
+
+- All four pods live in `$APP_NAMESPACE` (`agc-sites`). All Cilium policies and the WAF binding scope to that namespace / the Gateway.
+- **Labels matter.** Each tenant has `site: <name>` \u2014 that's what `allow-agc-l7-get-only` matches on. `client` has `app: client` \u2014 that's what `client-may-call-contoso-get-only` matches on. If a customer asks "how do I add a 4th tenant?" the answer is *one HTTPRoute + add the new value to the `site` selector*.
+- **Only `GET /` and `GET /products` are whitelisted** for the three tenants. Everything else returns 403 \u2014 that's the punchline of 4b.\n- **Only `client \u2192 contoso GET /` is whitelisted** east-west. `client \u2192 contoso POST` returns 403 (L7 deny). `client \u2192 fabrikam` times out as `000` (L4 deny \u2014 no policy whitelists this pair at all). That distinction is the punchline of 4c.
+
 **What this block does, at a glance:**
 
 One `kubectl apply` lays down every Kubernetes object the demo needs. Read the manifest as **six layers** stacked on top of each other:
@@ -135,20 +154,20 @@ One `kubectl apply` lays down every Kubernetes object the demo needs. Read the m
 | # | Layer | What it does |
 |---|---|---|
 | 1 | **Two namespaces** | `$ALB_NAMESPACE` for the AGC frontend intent (platform team), `$APP_NAMESPACE` for workloads + policies (app team). Mirrors the ownership boundary AGC docs recommend. |
-| 2 | **`ApplicationLoadBalancer` CR** | The *declaration of intent* that makes AGC come into existence. Empty `associations: []` = managed-by-ALB mode → AKS auto-creates the subnet, AGC resource, and workload-identity federation. **7 lines of YAML → a real Azure load balancer.** |
-| 3 | **3 nginx tenants + 1 client pod** | Each tenant has site-specific HTML so 4a can prove which backend served the response. The `client` curl pod is for east-west tests in 4c. The `site:<name>` label is what Cilium policies match on. |
-| 4 | **Gateway + 3 HTTPRoutes** | One Gateway on port 80, three `HTTPRoute`s binding `<site>.example.com` to each backend. **One public IP, three sites.** Adding a 4th tenant is one more HTTPRoute. |
+| 2 | **`ApplicationLoadBalancer` CR** | The *declaration of intent* that makes AGC come into existence. Empty `associations: []` = managed-by-ALB mode \u2192 AKS auto-creates the subnet, AGC resource, and workload-identity federation. **7 lines of YAML \u2192 a real Azure load balancer.** |
+| 3 | **contoso, fabrikam, adventure + client pod** | Three nginx tenants (each with their own ConfigMap-backed HTML) and one curl pod for east-west tests. Pods are labelled `site:<name>` so the L7 policy can select them. |
+| 4 | **Gateway + 3 HTTPRoutes** | One Gateway on port 80; three `HTTPRoute`s pinning `contoso.example.com`, `fabrikam.example.com`, and `adventure.example.com` to their respective Services. **One public IP, three sites.** |
 | 5 | **4 `CiliumNetworkPolicy` objects** | The L7 lockdown. Additive whitelists on top of default-deny. *Detail below.* |
-| 6 | **`WebApplicationFirewallPolicy` CRD** | The Kubernetes-side binding that attaches the WAF policy from step 1 to the Gateway. Scoped Gateway-wide → all three tenants protected. |
+| 6 | **`WebApplicationFirewallPolicy` CRD** | The Kubernetes-side binding that attaches the WAF policy from step 1 to the Gateway. Scoped Gateway-wide \u2192 all three tenants protected. |
 
 **The four Cilium policies, in plain English:**
 
-1. **`default-deny-all`** — turn off the cluster. Every pod in `$APP_NAMESPACE` denies all ingress + egress. Nothing works after this alone (intentional). *Syntax tell:* `ingress: [{}]` (one empty rule = deny-all) ≠ `ingress: []` (no rule = no-op).
-2. **`allow-dns-egress`** — turn DNS back on. Without it, the apps work but can't find each other.
-3. **`allow-agc-l7-get-only`** — the **north-south** allow. The three tenant pods accept inbound 8080, but only `GET /` and `GET /products`. Anything else gets a Cilium-synthesized 403 *before nginx sees it*. (Both `world` and `cluster` are listed as sources because AGC traffic enters via a node-local hop tagged `cluster`, not `world` — caught us during build.)
-4. **`client-may-call-contoso-get-only`** — the **east-west** allow. `client` may call `contoso` on `GET /` only. Cilium policies are additive: both source-egress AND destination-ingress must permit, which is why 4c shows three different verdicts (`200`, `403`, `000`) for three different policy interactions.
+1. **`default-deny-all`** \u2014 turn off the cluster. Every pod in `$APP_NAMESPACE` denies all ingress + egress. Nothing works after this alone (intentional). *Syntax tell:* `ingress: [{}]` (one empty rule = deny-all) \u2260 `ingress: []` (no rule = no-op).
+2. **`allow-dns-egress`** \u2014 turn DNS back on. Without it, the apps work but can't find each other.
+3. **`allow-agc-l7-get-only`** \u2014 the **north-south** allow. The three tenant pods accept inbound 8080, but only `GET /` and `GET /products`. Anything else gets a Cilium-synthesized 403 *before nginx sees it*. (Both `world` and `cluster` are listed as sources because AGC traffic enters via a node-local hop tagged `cluster`, not `world` \u2014 caught us during build.)
+4. **`client-may-call-contoso-get-only`** \u2014 the **east-west** allow. `client` may call `contoso` on `GET /` only. Cilium policies are additive: both source-egress AND destination-ingress must permit, which is why 4c shows three different verdicts (`200`, `403`, `000`) for three different policy interactions.
 
-**Operational note on WAF:** runs in **Prevention** for prod, **Detection** for tuning — one CLI flag flips between them. Can also be scoped per-`HTTPRoute` for per-tenant rollout.
+**Operational note on WAF:** runs in **Prevention** for prod, **Detection** for tuning \u2014 one CLI flag flips between them. Can also be scoped per-`HTTPRoute` for per-tenant rollout.
 
 **After applying, we wait for two green lights:**
 
