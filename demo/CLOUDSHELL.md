@@ -24,7 +24,7 @@ Hands-on-keyboard runbook. Paste each block into **Azure Cloud Shell** (<https:/
 - One public IP, three different `<h1>Hello from <site></h1>` responses (4a).
 - WAF blocks SQLi and path-traversal at AGC; legit traffic still gets through (4a-bonus).
 - `POST /` returns `403` from Cilium; `GET /products` returns `404` from nginx — proof L7 inspection is real (4b).
-- Pod-to-pod calls hit the same enforcement, with **no AGC in the path** (4c).
+- Pod-to-pod calls hit the same enforcement (4c).
 - Egress to the internet silently times out; DNS still resolves (4d, 4e).
 
 ---
@@ -483,7 +483,7 @@ Expected: ALB CR `Deployment=True`, all 4 CNPs `VALID=True`, WAF `Programmed=Tru
 | **4a** Multi-site routing | **AGC** (the front door) | Gateway API `HTTPRoute` hostname matching on the AGC frontend | North-south: internet → cluster |
 | **4a-bonus** SQLi / path-traversal blocked at the edge | **AGC + Azure WAF** (DRS 2.1) | `WebApplicationFirewallPolicy` CRD bound to the Gateway | North-south: internet → AGC (request never reaches the pod) |
 | **4b** GET vs POST/PUT/DELETE, /products vs /admin | **ACNS L7** (the bouncer at the pod door) | `CiliumNetworkPolicy` L7 rules at the contoso/fabrikam/adventure pod | North-south *behind* AGC: AGC → pod |
-| **4c** client → contoso GET/POST, client → fabrikam | **ACNS L7** (east-west, no AGC involved) | Same `CiliumNetworkPolicy` L7 rules, applied to in-cluster pod-to-pod | **East-west: pod ↔ pod** |
+| **4c** client → contoso GET/POST, client → fabrikam | **ACNS L7** (east-west) | Same `CiliumNetworkPolicy` L7 rules, applied to in-cluster pod-to-pod | **East-west: pod ↔ pod** |
 | **4d** Backend pod → bing.com | **ACNS** default-deny egress | `default-deny-all` CNP at the pod | East-west out: pod → internet |
 | **4e** DNS still resolves | **ACNS** carve-out | `allow-dns-egress` CNP | East-west to kube-dns |
 
@@ -556,7 +556,7 @@ done
 
 **Takeaway** — *"One flag at cluster create time, one Gateway+HTTPRoute YAML, and you have a managed multi-tenant L7 frontend that's invisible to your app teams."*
 
-### 4a-bonus. Add WAF to AGC — the AGC superpower that ACNS alone can't give you
+### 4a-bonus. Add WAF to AGC — the AGC superpower for ACNS customers
 
 | Tests | Layer | What's enforcing | Direction |
 |---|---|---|---|
@@ -635,8 +635,8 @@ malicious   GET /?id=1 OR 1=1           -> 403
 
 **What it shows:**
 
-- AGC doesn't filter by method or path — it's a load balancer, not a security product. Every request reaches the pod's network interface.
-- **ACNS L7 is what decides.** Cilium has an HTTP-aware proxy in eBPF. It parses the actual method and path and matches against `allow-agc-l7-get-only` (only `GET` on `/` and `/products`).
+- AGC delivers every request to the pod — that's its job as the L7 frontend. **ACNS L7 is what decides** whether each request lives or dies, based on actual HTTP method and path.
+- Cilium has an HTTP-aware proxy in eBPF. It parses the request and matches against `allow-agc-l7-get-only` (only `GET` on `/` and `/products`).
 - Watch the **403 vs 404 distinction**: a `403` is Cilium synthesizing a denial *before* nginx sees the request; a `404` means Cilium let the request through and nginx returned the 404 itself. Different layer doing the work, depending on the rule.
 - A vanilla Kubernetes NetworkPolicy could not produce this — it can only allow or deny port 8080 wholesale. ACNS L7 lets you say "GET on 8080 yes, POST on 8080 no" — same port, different verb, different verdict.
 
@@ -670,7 +670,7 @@ GET /admin -> 403
 | `GET / -> 200` | nginx | AGC routed → ACNS allowed (`GET /` in whitelist) → nginx served the page | The happy path. Customers' actual users see this. |
 | `POST / -> 403` | **ACNS** | AGC routed → **ACNS rejected the method** → nginx never saw it | Same port as GET. Vanilla L4 NetworkPolicy could not block this. |
 | `PUT / -> 403` | **ACNS** | Same as POST | Default-deny on methods. Only GET is whitelisted. |
-| `DELETE / -> 403` | **ACNS** | Same as POST | A compromised AGC route can't delete data on the pod. |
+| `DELETE / -> 403` | **ACNS** | Same as POST | Method-level enforcement at the pod boundary. |
 | `GET /products -> 404` | **nginx** | AGC routed → ACNS *allowed* (`/products` in whitelist) → nginx had no such file → returned 404 | **The proof point.** 404 means the request reached the app. ACNS is doing real L7 inspection, not blanket-blocking. |
 | `GET /admin -> 403` | **ACNS** | AGC routed → **ACNS rejected the path** → nginx never saw `/admin` | The bouncer at the door rejected it. nginx never knew it was coming. |
 
@@ -680,19 +680,19 @@ GET /admin -> 403
 
 **Takeaway** — *"AGC delivered all seven requests. ACNS decided which four to drop and which three to forward. AGC owns *getting traffic in*. ACNS owns *deciding what gets to flow*."*
 
-### 4c. ACNS L7 east-west — same enforcement, no AGC involved
+### 4c. ACNS L7 east-west — same enforcement, pod-to-pod
 
 | Tests | Layer | What's enforcing | Direction |
 |---|---|---|---|
-| **4c** client → contoso GET/POST, client → fabrikam | **ACNS L7** (east-west, no AGC involved) | Same `CiliumNetworkPolicy` L7 rules, applied to in-cluster pod-to-pod | **East-west: pod ↔ pod** |
+| **4c** client → contoso GET/POST, client → fabrikam | **ACNS L7** (east-west) | Same `CiliumNetworkPolicy` L7 rules, applied to in-cluster pod-to-pod | **East-west: pod ↔ pod** |
 
-**What we're testing:** Three calls from the in-cluster `client` pod directly to `contoso` and `fabrikam` Services via cluster DNS. AGC is not in the data path. Same Cilium L7 policies as 4b — but now the *source* is another pod, not the internet.
+**What we're testing:** Three calls from the in-cluster `client` pod directly to `contoso` and `fabrikam` Services via cluster DNS. This is purely pod-to-pod traffic. Same Cilium L7 policies as 4b — but now the *source* is another pod, not the internet.
 
 **What it shows:**
 
-- The same Cilium L7 rules that protected contoso from AGC traffic in 4b also protect it from *other pods* in the cluster. **Source-agnostic enforcement.**
-- This is the half of the network AGC was never designed to touch. AGC handles north-south ingress; ACNS handles east-west pod-to-pod with identity-based, bidirectional whitelists.
-- Lateral movement (a compromised pod pivoting to richer ones inside the cluster) is the most dangerous attack pattern in Kubernetes. Without east-west L7 enforcement, you have no defense once an attacker is already inside.
+- The same Cilium L7 rules that protected contoso from internet traffic in 4b also protect it from *other pods* in the cluster. **Source-agnostic enforcement.**
+- ACNS owns the east-west dimension end-to-end — identity-based, bidirectional whitelists at the pod level.
+- Lateral movement (a compromised pod pivoting to richer ones inside the cluster) is the most dangerous attack pattern in Kubernetes. ACNS L7 is what gives you a defense once an attacker is already inside.
 - Watch the **403 vs 000 distinction** — they tell two different stories. `403` means Cilium let TCP complete and the HTTP request arrive, then synthesized a denial. `000` means Cilium dropped the SYN before TCP ever completed. Different layer, both denied. In production this distinction is alertable — a 403 is a misbehaving caller you know about; a 000 is a peer that should have no business reaching this pod at all.
 
 ```bash
@@ -719,9 +719,9 @@ client->fabrikam     -> 000
 | `client->contoso POST -> 403` | **ACNS** | Cilium L7 proxy parsed HTTP, saw POST, synthesized 403 | Right pod, right port, **wrong method.** A compromised neighbor cannot escalate to dangerous methods even on services it can already reach. |
 | `client->fabrikam -> 000` | **ACNS at L4** | TCP handshake never completed — Cilium silently dropped the SYN | **No policy whitelists `client → fabrikam`.** Default-deny kicks in *before HTTP exists*. From the attacker's perspective, fabrikam might as well not exist. |
 
-> **Verdict:** AGC is not in this picture. ACNS allowed the one whitelisted call, denied the wrong-method call at L7 with a 403, and denied the unknown-peer call at L4 with a silent drop.
+> **Verdict:** ACNS allowed the one whitelisted call, denied the wrong-method call at L7 with a 403, and denied the unknown-peer call at L4 with a silent drop.
 
-**The takeaway to repeat to the customer:** *"AGC controls the front door of the building. ACNS controls every interior door. Even when an attacker is already inside the cluster — even when the attacker is the *source* of malicious traffic — ACNS still enforces the exact same method-and-path rules. There is no 'trusted east-west' in zero-trust, and ACNS is what makes that real. AGC was never designed to touch this half of the traffic graph; ACNS is what completes the story."*
+**The takeaway to repeat to the customer:** *"AGC controls the front door of the building. ACNS controls every interior door. Even when an attacker is already inside the cluster — even when the attacker is the *source* of malicious traffic — ACNS still enforces the exact same method-and-path rules. There is no 'trusted east-west' in zero-trust, and ACNS is what makes that real."*
 
 ### 4d. ACNS default-deny egress — stopping pods from calling out
 
@@ -734,7 +734,7 @@ client->fabrikam     -> 000
 **What it shows:**
 
 - This is the inverse of 4b/4c — we've been controlling traffic *coming in* to pods. Now we're controlling traffic *going out*.
-- AGC is irrelevant here. AGC is an *ingress* product — it does not handle pod egress. If you only had AGC and no ACNS, this `wget` would succeed.
+- ACNS owns the egress dimension. With it, you decide exactly which destinations workloads can reach.
 - Almost every modern attack on Kubernetes ends with the compromised pod calling out — exfiltration, second-stage payload download, C2 callback. Cutting egress breaks the attack chain.
 - Cilium silent-drops the SYN at the kernel — no RST, no ICMP unreachable, just a hung connection that eventually times out. From the attacker's perspective the network is a black hole, and that ambiguity is itself a defense.
 - The pattern is the customer's explicit ask: *allow only the controller endpoints, deny everything else.* Specific outbound destinations would be added with `toFQDNs: [matchName: 'api.vendor.com']` rules.
@@ -758,9 +758,9 @@ rc=1  (non-zero = blocked)
 - **DNS still resolves.** `getaddrinfo("www.bing.com")` succeeded — kube-dns was reached via `allow-dns-egress`. So this isn't "the cluster is broken," it's "the cluster is locked down with a DNS carve-out."
 - **The TCP connection to bing's IP silently times out.** Cilium drops the SYN at the kernel level — no RST, no ICMP unreachable, no useful error. After 5s wget gives up. This is Cilium's documented default-deny behavior ([silent drop](https://docs.cilium.io/en/latest/security/policy/intro/#policy-deny-response-handling)).
 - **`rc=1`** is the application-visible result. **If a workload were exfiltrating data, this is what stops it.** The attacker doesn't even get a useful error code to retry against.
-- **AGC is not in this picture.** AGC is irrelevant to outbound pod traffic. ACNS owns this dimension entirely.
+- **ACNS owns the egress dimension entirely.** Pod → internet traffic is governed by Cilium policies at the eBPF datapath.
 
-> **Verdict:** AGC not involved (this is outbound). ACNS denied the TCP connection silently at the eBPF datapath because no egress allow rule whitelists the public internet.
+> **Verdict:** ACNS denied the TCP connection silently at the eBPF datapath because no egress allow rule whitelists the public internet.
 
 **The takeaway to repeat to the customer:** *"AGC handles inbound. ACNS handles inbound *and* outbound. With four `CiliumNetworkPolicy` objects we've built default-deny in both directions plus surgical carve-outs for DNS, AGC ingress, and one specific east-west call. A compromised pod can't talk to the internet, can't move laterally, and can't send the wrong HTTP method to its allowed neighbors. That's a complete zero-trust posture, end to end."*
 
@@ -775,7 +775,6 @@ rc=1  (non-zero = blocked)
 **What it shows:**
 
 - 4d showed default-deny working. 4e shows we didn't just "unplug the network" — we built a *precise* allow list that keeps apps functional. `allow-dns-egress` is the one carve-out that makes default-deny survivable.
-- AGC is not on this path. Pure pod-to-kube-dns traffic.
 - Compare with 4d: same pod, same policies. DNS resolved (allowed); TCP to bing didn't (denied). **Same network primitives, two outcomes — that precision is the demo.**
 - The carve-out is tightenable. Replace `matchPattern: '*'` with `matchPattern: '*.contoso.com'` and Cilium silently drops every other DNS query *itself*, not just the eventual TCP connection.
 - This is the difference between "we have policy" (an audit checkbox) and "we can demonstrate policy enforcing surgically" (a production posture).
@@ -801,7 +800,7 @@ Address: 10.0.37.14
 - **`Address: 10.0.37.14`** — the resolved Service IP for contoso. A real DNS answer, not a timeout, not NXDOMAIN.
 - **Compare with 4d.** Same pod resolved `www.bing.com` (DNS allowed) but couldn't connect to it (TCP denied). DNS is uniformly allowed (by name pattern `*`), but **TCP/UDP to anywhere except kube-dns:53** is dropped. That's the precision the customer ask demanded.
 
-> **Verdict:** AGC not involved. ACNS allowed this one specific call (port 53 to kube-dns endpoints) because it's the carve-out we explicitly wrote.
+> **Verdict:** ACNS allowed this one specific call (port 53 to kube-dns endpoints) because it's the carve-out we explicitly wrote.
 
 **The takeaway to repeat to the customer:** *"We didn't break workloads' ability to discover services. We only blocked the actual data path to destinations that aren't on our allow list. That's the difference between 'lock it all down and break the app' and 'lock it all down and the app keeps working for the things you allowed.' And every one of those allow rules can be tightened further — down to specific FQDNs, methods, paths — with a one-line YAML change."*
 
@@ -833,7 +832,7 @@ Walk the audience back through the demo in plain language. Hit each bullet:
 - **4a — AGC routes by hostname.** Same public IP, three different `<h1>Hello from <site></h1>` responses. One Gateway + three `HTTPRoute`s replaced what used to be a DIY ingress controller.
 - **4a-bonus — AGC has WAF built in.** A SQLi payload and a path-traversal payload both hit `403` *at AGC*. nginx never saw them. Same `GET /` from 4a still returned `200` — WAF didn't break the app.
 - **4b — ACNS L7 inspects HTTP.** `POST /` returned `403` (synthesized by Cilium); `GET /products` returned `404` (served by nginx). **403 from Cilium, 404 from nginx** — proof that L7 inspection is real, not blanket-block.
-- **4c — ACNS enforces east-west too.** Pod-to-pod, no AGC in the path. `client → contoso GET` got `200`, `client → contoso POST` got `403`, `client → fabrikam` got `000` (TCP never completed). Three calls, three different layers of denial.
+- **4c — ACNS enforces east-west too.** Pod-to-pod enforcement. `client → contoso GET` got `200`, `client → contoso POST` got `403`, `client → fabrikam` got `000` (TCP never completed). Three calls, three different layers of denial.
 - **4d — ACNS blocks egress by default.** A backend pod tried to reach bing.com, got a silent timeout. No exfil, no C2.
 - **4e — The lockdown is precise.** Same pod still resolves DNS through kube-dns, because we explicitly allowed it.
 
