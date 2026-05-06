@@ -128,18 +128,19 @@ We're standing up a fake "shared cluster" that hosts three businesses. They're s
 
 | Pod | Hostname | Role in the demo |
 |---|---|---|
-| **`contoso`** | `contoso.example.com` | Our headline tenant. Pretty much every demo step lands on contoso \u2014 it's the one we route to in 4a, the target WAF inspects in 4a-bonus, the pod we send `GET` and `POST` against in 4b, the destination of the east-west call in 4c, and the pod we exec into for 4d and 4e. |
+| **`contoso`** | `contoso.example.com` | Our headline tenant. Pretty much every demo step lands on contoso — it's the one we route to in 4a, the target WAF inspects in 4a-bonus, the pod we send `GET` and `POST` against in 4b, the destination of the east-west call in 4c, and the pod we exec into for 4d and 4e. |
 | **`fabrikam`** | `fabrikam.example.com` | Second tenant. Used in 4a to prove multi-site routing (different `<h1>` in the response), and in 4c as the *unwhitelisted* east-west target (the `000` case). |
 | **`adventure`** | `adventure.example.com` | Third tenant. Used only in 4a multi-site routing. Proves "adding a 3rd tenant is one more HTTPRoute, zero Azure-side work." |
-| **`client`** | *(no hostname \u2014 in-cluster only)* | A `curlimages/curl` pod that just sleeps. Step 4c `kubectl exec`s into it to make pod-to-pod calls without going through AGC. This is how we demo east-west enforcement. |
+| **`client`** | *(no hostname — in-cluster only)* | A `curlimages/curl` pod that just sleeps. Step 4c `kubectl exec`s into it to make pod-to-pod calls without going through AGC. This is how we demo east-west enforcement. |
 
-Each tenant is one nginx pod listening on **port 8080** with site-specific HTML (`Hello from Contoso`, etc.) so we can read the response body and prove which backend served it. We don't actually own `*.example.com` \u2014 step 4 forges the `Host:` header with `curl --resolve $IP`.
+Each tenant is one nginx pod listening on **port 8080** with site-specific HTML (`Hello from Contoso`, etc.) so we can read the response body and prove which backend served it. We don't actually own `*.example.com` — step 4 forges the `Host:` header with `curl --resolve $IP`.
 
 **Things to remember when you're running step 4:**
 
 - All four pods live in `$APP_NAMESPACE` (`agc-sites`). All Cilium policies and the WAF binding scope to that namespace / the Gateway.
-- **Labels matter.** Each tenant has `site: <name>` \u2014 that's what `allow-agc-l7-get-only` matches on. `client` has `app: client` \u2014 that's what `client-may-call-contoso-get-only` matches on. If a customer asks "how do I add a 4th tenant?" the answer is *one HTTPRoute + add the new value to the `site` selector*.
-- **Only `GET /` and `GET /products` are whitelisted** for the three tenants. Everything else returns 403 \u2014 that's the punchline of 4b.\n- **Only `client \u2192 contoso GET /` is whitelisted** east-west. `client \u2192 contoso POST` returns 403 (L7 deny). `client \u2192 fabrikam` times out as `000` (L4 deny \u2014 no policy whitelists this pair at all). That distinction is the punchline of 4c.
+- **Labels matter.** Each tenant has `site: <name>` — that's what `allow-agc-l7-get-only` matches on. `client` has `app: client` — that's what `client-may-call-contoso-get-only` matches on. If a customer asks "how do I add a 4th tenant?" the answer is *one HTTPRoute + add the new value to the `site` selector*.
+- **Only `GET /` and `GET /products` are whitelisted** for the three tenants. Everything else returns 403 — that's the punchline of 4b.
+- **Only `client → contoso GET /` is whitelisted** east-west. `client → contoso POST` returns 403 (L7 deny). `client → fabrikam` times out as `000` (L4 deny — no policy whitelists this pair at all). That distinction is the punchline of 4c.
 
 **What this block does, at a glance:**
 
@@ -148,20 +149,20 @@ One `kubectl apply` lays down every Kubernetes object the demo needs. Read the m
 | # | Layer | What it does |
 |---|---|---|
 | 1 | **Two namespaces** | `$ALB_NAMESPACE` for the AGC frontend intent (platform team), `$APP_NAMESPACE` for workloads + policies (app team). Mirrors the ownership boundary AGC docs recommend. |
-| 2 | **`ApplicationLoadBalancer` CR** | The *declaration of intent* that makes AGC come into existence. Empty `associations: []` = managed-by-ALB mode \u2192 AKS auto-creates the subnet, AGC resource, and workload-identity federation. **7 lines of YAML \u2192 a real Azure load balancer.** |
+| 2 | **`ApplicationLoadBalancer` CR** | The *declaration of intent* that makes AGC come into existence. Empty `associations: []` = managed-by-ALB mode → AKS auto-creates the subnet, AGC resource, and workload-identity federation. **7 lines of YAML → a real Azure load balancer.** |
 | 3 | **contoso, fabrikam, adventure + client pod** | Three nginx tenants (each with their own ConfigMap-backed HTML) and one curl pod for east-west tests. Pods are labelled `site:<name>` so the L7 policy can select them. |
 | 4 | **Gateway + 3 HTTPRoutes** | One Gateway on port 80; three `HTTPRoute`s pinning `contoso.example.com`, `fabrikam.example.com`, and `adventure.example.com` to their respective Services. **One public IP, three sites.** |
 | 5 | **4 `CiliumNetworkPolicy` objects** | The L7 lockdown. Additive whitelists on top of default-deny. *Detail below.* |
-| 6 | **`WebApplicationFirewallPolicy` CRD** | The Kubernetes-side binding that attaches the WAF policy from step 1 to the Gateway. Scoped Gateway-wide \u2192 all three tenants protected. |
+| 6 | **`WebApplicationFirewallPolicy` CRD** | The Kubernetes-side binding that attaches the WAF policy from step 1 to the Gateway. Scoped Gateway-wide → all three tenants protected. |
 
 **The four Cilium policies, in plain English:**
 
-1. **`default-deny-all`** \u2014 turn off the cluster. Every pod in `$APP_NAMESPACE` denies all ingress + egress. Nothing works after this alone (intentional). *Syntax tell:* `ingress: [{}]` (one empty rule = deny-all) \u2260 `ingress: []` (no rule = no-op).
-2. **`allow-dns-egress`** \u2014 turn DNS back on. Without it, the apps work but can't find each other.
-3. **`allow-agc-l7-get-only`** \u2014 the **north-south** allow. The three tenant pods accept inbound 8080, but only `GET /` and `GET /products`. Anything else gets a Cilium-synthesized 403 *before nginx sees it*. (Both `world` and `cluster` are listed as sources because AGC traffic enters via a node-local hop tagged `cluster`, not `world` \u2014 caught us during build.)
-4. **`client-may-call-contoso-get-only`** \u2014 the **east-west** allow. `client` may call `contoso` on `GET /` only. Cilium policies are additive: both source-egress AND destination-ingress must permit, which is why 4c shows three different verdicts (`200`, `403`, `000`) for three different policy interactions.
+1. **`default-deny-all`** — turn off the cluster. Every pod in `$APP_NAMESPACE` denies all ingress + egress. Nothing works after this alone (intentional). *Syntax tell:* `ingress: [{}]` (one empty rule = deny-all) ≠ `ingress: []` (no rule = no-op).
+2. **`allow-dns-egress`** — turn DNS back on. Without it, the apps work but can't find each other.
+3. **`allow-agc-l7-get-only`** — the **north-south** allow. The three tenant pods accept inbound 8080, but only `GET /` and `GET /products`. Anything else gets a Cilium-synthesized 403 *before nginx sees it*. (Both `world` and `cluster` are listed as sources because AGC traffic enters via a node-local hop tagged `cluster`, not `world` — caught us during build.)
+4. **`client-may-call-contoso-get-only`** — the **east-west** allow. `client` may call `contoso` on `GET /` only. Cilium policies are additive: both source-egress AND destination-ingress must permit, which is why 4c shows three different verdicts (`200`, `403`, `000`) for three different policy interactions.
 
-**Operational note on WAF:** runs in **Prevention** for prod, **Detection** for tuning \u2014 one CLI flag flips between them. Can also be scoped per-`HTTPRoute` for per-tenant rollout.
+**Operational note on WAF:** runs in **Prevention** for prod, **Detection** for tuning — one CLI flag flips between them. Can also be scoped per-`HTTPRoute` for per-tenant rollout.
 
 **After applying, we wait for two green lights:**
 
@@ -564,16 +565,16 @@ Up to this point, AGC has been doing host-based routing — it reads the `Host:`
 
 **Why this matters:**
 
-- **It's a managed service, not a project.** Microsoft writes the rules, tunes them, and keeps them current as new CVEs land. You don't maintain a ModSecurity ruleset, you don't tune false positives at 3am, you don't update signatures \u2014 it's the same managed Default Rule Set 2.1 that powers Front Door and standalone App Gateway WAF.
-- **It catches things ACNS cannot.** ACNS L7 enforces *behavior* (this method on this path is allowed). WAF enforces *content* (this query string contains a SQLi pattern). A malicious `GET /?id=1 OR 1=1` is still a `GET /` \u2014 ACNS would happily forward it because the method and path are whitelisted. WAF sees the payload and blocks it.
-- **It runs at the edge.** Malicious requests die at the AGC frontend, not at the pod. Your application code, your nginx, your business logic \u2014 none of it ever sees an attack signature. That's less attack surface, less log noise, less load on the cluster.
+- **It's a managed service, not a project.** Microsoft writes the rules, tunes them, and keeps them current as new CVEs land. You don't maintain a ModSecurity ruleset, you don't tune false positives at 3am, you don't update signatures — it's the same managed Default Rule Set 2.1 that powers Front Door and standalone App Gateway WAF.
+- **It catches things ACNS cannot.** ACNS L7 enforces *behavior* (this method on this path is allowed). WAF enforces *content* (this query string contains a SQLi pattern). A malicious `GET /?id=1 OR 1=1` is still a `GET /` — ACNS would happily forward it because the method and path are whitelisted. WAF sees the payload and blocks it.
+- **It runs at the edge.** Malicious requests die at the AGC frontend, not at the pod. Your application code, your nginx, your business logic — none of it ever sees an attack signature. That's less attack surface, less log noise, less load on the cluster.
 - **It's two YAMLs.** One Azure WAF policy + one `WebApplicationFirewallPolicy` CRD bound to the Gateway. We wired this up in step 1 + step 2; right now it's `Programmed=True` and scoped Gateway-wide, so all three tenants are protected automatically.
 
 **Why both layers exist** (have this table on screen during the test):
 
 | Threat | AGC WAF (edge) | ACNS L7 (pod) |
 |---|---|---|
-| `?text=/etc/passwd` path-traversal payload from internet | **Blocks (DRS rule match)** | Wouldn't have triggered (path is `/`, method is GET \u2014 passes ACNS) |
+| `?text=/etc/passwd` path-traversal payload from internet | **Blocks (DRS rule match)** | Wouldn't have triggered (path is `/`, method is GET — passes ACNS) |
 | `POST /` from internet | Forwards (no WAF rule against bare POST) | **Blocks (method not in whitelist)** |
 | `POST /` from a *compromised pod inside the cluster* | Doesn't see it | **Blocks (4c will prove this)** |
 | Zero-day SQLi against `/products?id=...` | **Blocks (DRS pattern match)** | Wouldn't catch (path is allowed) |
@@ -592,15 +593,18 @@ Up to this point, AGC has been doing host-based routing — it reads the `Host:`
 
 ```bash
 # Benign — should still get 200 from contoso (proves WAF doesn't break good traffic).
-curl -s -o /dev/null -w "benign      GET /                       -> %{http_code}\n" \
+curl -s -o /dev/null -w "benign      GET /                       -> %{http_code}
+" \
   --resolve contoso.example.com:80:$IP http://contoso.example.com/
 
 # Malicious — path-traversal payload in query string. DRS 2.1 will match.
-curl -s -o /dev/null -w "malicious   GET /?text=/etc/passwd      -> %{http_code}\n" \
+curl -s -o /dev/null -w "malicious   GET /?text=/etc/passwd      -> %{http_code}
+" \
   --resolve contoso.example.com:80:$IP "http://contoso.example.com/?text=/etc/passwd"
 
 # Malicious — classic SQLi tautology. DRS 2.1 will match.
-curl -s -o /dev/null -w "malicious   GET /?id=1%20OR%201=1       -> %{http_code}\n" \
+curl -s -o /dev/null -w "malicious   GET /?id=1%20OR%201=1       -> %{http_code}
+" \
   --resolve contoso.example.com:80:$IP "http://contoso.example.com/?id=1%20OR%201=1"
 ```
 
@@ -622,9 +626,9 @@ malicious   GET /?id=1 OR 1=1           -> 403
 **What WAF just did that we didn't have before:**
 
 - **It read the request body, not just the envelope.** In 4a, AGC looked at the `Host:` header and forwarded. Here, AGC opened up the URL and query string, scanned them against thousands of OWASP-class attack patterns, and rejected two of three. Same managed frontend, brand-new security capability.
-- **It blocked attacks ACNS would have let through.** Both malicious requests were `GET /` \u2014 ACNS's allow list says yes. WAF said no, because it inspects *content*, not just method and path. That's the gap WAF closes.
+- **It blocked attacks ACNS would have let through.** Both malicious requests were `GET /` — ACNS's allow list says yes. WAF said no, because it inspects *content*, not just method and path. That's the gap WAF closes.
 - **The attack never touched the pod.** No CPU spent, no log entries on contoso, no chance for the request to find a zero-day in nginx or your app code. The 403 was rendered by the AGC frontend itself.
-- **You didn't write any rules.** The Default Rule Set 2.1 ships with the policy. Microsoft maintains it. Your job was two YAMLs (the Azure WAF policy in step 1, the `WebApplicationFirewallPolicy` CRD in step 2) \u2014 the rules came with the service.
+- **You didn't write any rules.** The Default Rule Set 2.1 ships with the policy. Microsoft maintains it. Your job was two YAMLs (the Azure WAF policy in step 1, the `WebApplicationFirewallPolicy` CRD in step 2) — the rules came with the service.
 
 > **Verdict:** AGC brought traffic in **and stopped malicious traffic at the edge** with Azure WAF (DRS 2.1). ACNS never had to look at the request — it died one layer earlier. Outer perimeter / inner perimeter, working together.
 
@@ -647,11 +651,13 @@ malicious   GET /?id=1 OR 1=1           -> 403
 
 ```bash
 for m in GET POST PUT DELETE; do
-  curl -s -o /dev/null -w "$m / -> %{http_code}\n" \
+  curl -s -o /dev/null -w "$m / -> %{http_code}
+" \
     --max-time 10 -X $m --resolve contoso.example.com:80:$IP http://contoso.example.com/
 done
 for p in / /products /admin; do
-  curl -s -o /dev/null -w "GET $p -> %{http_code}\n" \
+  curl -s -o /dev/null -w "GET $p -> %{http_code}
+" \
     --max-time 10 --resolve contoso.example.com:80:$IP http://contoso.example.com$p
 done
 ```
@@ -703,9 +709,12 @@ GET /admin -> 403
 ```bash
 CLIENT=$(kubectl get pod -n $APP_NAMESPACE -l app=client -o jsonpath='{.items[0].metadata.name}')
 
-kubectl exec -n $APP_NAMESPACE $CLIENT -- curl -s -o /dev/null -w "client->contoso GET  -> %{http_code}\n" --max-time 5 http://contoso:8080/
-kubectl exec -n $APP_NAMESPACE $CLIENT -- curl -s -o /dev/null -w "client->contoso POST -> %{http_code}\n" --max-time 5 -X POST http://contoso:8080/
-kubectl exec -n $APP_NAMESPACE $CLIENT -- curl -s --ipv4 -o /dev/null -w "client->fabrikam     -> %{http_code}\n" --max-time 5 http://fabrikam:8080/
+kubectl exec -n $APP_NAMESPACE $CLIENT -- curl -s -o /dev/null -w "client->contoso GET  -> %{http_code}
+" --max-time 5 http://contoso:8080/
+kubectl exec -n $APP_NAMESPACE $CLIENT -- curl -s -o /dev/null -w "client->contoso POST -> %{http_code}
+" --max-time 5 -X POST http://contoso:8080/
+kubectl exec -n $APP_NAMESPACE $CLIENT -- curl -s --ipv4 -o /dev/null -w "client->fabrikam     -> %{http_code}
+" --max-time 5 http://fabrikam:8080/
 ```
 
 **Expected output:**
