@@ -777,6 +777,18 @@ Read the three lines top to bottom — they tell the whole story:
 - **`rc=1` is the punchline.** That non-zero exit code is what the workload sees. **If this pod were compromised and trying to exfiltrate data, this is the moment the attack dies.** No data leaves. The attacker doesn't even get a useful error to retry against — just a black hole.
 - **Notice what's enforcing this.** Not AGC. Not a firewall sitting outside the cluster. Cilium, in-kernel, on the same node as the pod. The decision is made before the packet ever leaves the host.
 
+**In plain English — what just happened, and what it proves:**
+
+A pod inside our cluster tried to reach bing.com. It couldn't. After 5 seconds it gave up.
+
+That's the whole story. We didn't get an error message saying "blocked." We didn't get "connection refused." We got *nothing* — a hung connection that timed out. To anyone (or anything) sitting in that pod, the public internet just doesn't exist.
+
+This proves three things:
+
+- **Pods can't phone home by default.** Even if a pod gets compromised tomorrow, it can't reach the internet to download malware, exfiltrate data, or check in with an attacker's server.
+- **The block is silent on purpose.** An attacker poking around inside a compromised pod can't tell whether the destination is blocked, down, or doesn't exist. That ambiguity slows them down.
+- **Cilium did this, not a network appliance.** No firewall rules, no NAT gateway config, no perimeter device. Just a Kubernetes YAML applied to the cluster.
+
 > **Verdict:** ACNS denied the TCP connection silently at the eBPF datapath because no egress allow rule whitelists the public internet.
 
 **The takeaway to repeat to the customer:** *"AGC handles inbound. ACNS handles inbound *and* outbound. With four `CiliumNetworkPolicy` objects we've built default-deny in both directions plus surgical carve-outs for DNS, AGC ingress, and one specific east-west call. A compromised pod can't talk to the internet, can't move laterally, and can't send the wrong HTTP method to its allowed neighbors. That's a complete zero-trust posture, end to end."*
@@ -828,6 +840,18 @@ This output is the mirror image of 4d's. There, `wget` printed `download timed o
 - **`Address: 10.0.37.14`** — a real DNS answer for the contoso Service. Not a timeout, not NXDOMAIN, not "I/O error." Service discovery is fully functional.
 - **Why the result is different from 4d.** Literally the same pod ran both commands. Nothing about the pod, the namespace, or the policies changed between them. The only difference was where the packet was headed: bing.com (off the allow list → silent drop) vs kube-dns (on the allow list → forwarded normally). The decision is made per-packet, in-kernel, against the four CNPs.
 - **That's the whole zero-trust posture in one comparison.** Default-deny everywhere, plus a small set of explicit carve-outs. Anything on the list works normally. Anything off the list dies silently in the kernel. No app changes, no sidecars, no agents — just policy.
+
+**In plain English — what just happened, and what it proves:**
+
+The same pod that couldn't reach bing.com a moment ago just looked up another pod's address inside the cluster — and got an answer instantly.
+
+Nothing about the pod changed. Same name, same labels, same four policies attached. The only difference is *where the packet was going*. Bing.com isn't on our allow list, so Cilium dropped it. Kube-dns *is* on the allow list (that's the `allow-dns-egress` policy), so Cilium let it through.
+
+This proves three things:
+
+- **Default-deny doesn't break the cluster.** Apps can still find each other by name. Service discovery still works. The carve-out for DNS is the one tiny exception that keeps Kubernetes itself running.
+- **The lockdown is precise, not blunt.** We're not unplugging the network. We're saying "these specific destinations are allowed, everything else is denied," and Cilium enforces that decision per-packet.
+- **You can tighten it further any time.** Today DNS to any name is allowed. One YAML edit and you can restrict it to just `*.svc.cluster.local` — dropping DNS queries for outside names before they even leave the node.
 
 > **Verdict:** ACNS allowed this one specific call (port 53 to kube-dns endpoints) because it's the carve-out we explicitly wrote.
 
