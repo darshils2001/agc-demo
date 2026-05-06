@@ -8,6 +8,28 @@ Hands-on-keyboard runbook. Paste each block into **Azure Cloud Shell** (<https:/
 
 ---
 
+## Open the demo (read this out before running anything)
+
+**What we're going to do today:**
+- Stand up an AKS cluster with two add-ons: **AGC** (Application Gateway for Containers) for managed ingress, and **ACNS L7** (Advanced Container Networking Services) for in-cluster L7 policy.
+- Wire three sample tenants — contoso, fabrikam, adventure — behind a single AGC public IP, then layer Cilium L7 policies on top of every pod.
+- Turn on Azure WAF on AGC so the front door is also a metal detector.
+
+**The story in one line:**
+- **AGC brings traffic *into* the cluster.** With WAF, AGC also blocks signature-based attacks at the edge.
+- **ACNS L7 decides what traffic, from any source, is allowed to flow *within* the cluster** — north-south behind AGC, east-west pod-to-pod, and outbound.
+- Two add-ons, two directions, one zero-trust posture.
+
+**What to watch for in step 4:**
+- One public IP, three different `<h1>Hello from <site></h1>` responses (4a).
+- WAF blocks SQLi and path-traversal at AGC; legit traffic still gets through (4a-bonus).
+- `POST /` returns `403` from Cilium; `GET /products` returns `404` from nginx — proof L7 inspection is real (4b).
+- Pod-to-pod calls hit the same enforcement, with **no AGC in the path** (4c).
+- Egress to the internet silently times out; DNS still resolves (4d, 4e).
+- Every drop is observable in real time from the kernel (5).
+
+---
+
 ## 0. Set variables and pick your subscription
 
 **Talking points:**
