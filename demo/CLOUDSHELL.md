@@ -157,10 +157,12 @@ One `kubectl apply` lays down every Kubernetes object the demo needs. Read the m
 
 **The four Cilium policies, in plain English:**
 
-1. **`default-deny-all`** — turn off the cluster. Every pod in `$APP_NAMESPACE` denies all ingress + egress. Nothing works after this alone (intentional). *Syntax tell:* `ingress: [{}]` (one empty rule = deny-all) ≠ `ingress: []` (no rule = no-op).
-2. **`allow-dns-egress`** — turn DNS back on. Without it, the apps work but can't find each other.
-3. **`allow-agc-l7-get-only`** — the **north-south** allow. The three tenant pods accept inbound 8080, but only `GET /` and `GET /products`. Anything else gets a Cilium-synthesized 403 *before nginx sees it*. (Both `world` and `cluster` are listed as sources because AGC traffic enters via a node-local hop tagged `cluster`, not `world` — caught us during build.)
-4. **`client-may-call-contoso-get-only`** — the **east-west** allow. `client` may call `contoso` on `GET /` only. Cilium policies are additive: both source-egress AND destination-ingress must permit, which is why 4c shows three different verdicts (`200`, `403`, `000`) for three different policy interactions.
+| # | Policy | What it does | Why it's there | Demonstrated in |
+|---|---|---|---|---|
+| 1 | **`default-deny-all`** | Drops every packet in and out of every pod in `$APP_NAMESPACE`. Nothing works after this alone — intentional. | The foundation of zero-trust. Everything else is an additive carve-out on top. *Syntax tell:* `ingress: [{}]` (one empty rule = deny-all) ≠ `ingress: []` (no rule = no-op). | 4d (the silent timeout to bing.com) |
+| 2 | **`allow-dns-egress`** | Lets every pod send UDP/53 queries to kube-dns. | Without it nothing in Kubernetes works — service discovery, controllers, every client library breaks. The minimum carve-out you have to add. | 4e (nslookup succeeds) |
+| 3 | **`allow-agc-l7-get-only`** | The three tenant pods accept inbound on 8080, but only `GET /` and `GET /products`. Anything else is dropped with a Cilium-synthesized 403 before nginx ever sees it. | The **north-south** allow. This is what turns AGC's "any HTTP method gets in" into "only the methods the app actually serves get in." (Sources are `world` AND `cluster` because AGC traffic enters via a node-local hop tagged `cluster` — caught us during build.) | 4b (`POST /` → 403, `GET /products` → 404 from nginx) |
+| 4 | **`client-may-call-contoso-get-only`** | `client` pod is allowed to call `contoso` pod on `GET /` only. Nothing else east-west works. | The **east-west** allow. Cilium policies are additive — both source-egress AND destination-ingress must permit. That's why 4c gets three different verdicts (`200`, `403`, `000`) from three different policy interactions. | 4c (the three-verdict pod-to-pod test) |
 
 **Operational note on WAF:** runs in **Prevention** for prod, **Detection** for tuning — one CLI flag flips between them. Can also be scoped per-`HTTPRoute` for per-tenant rollout.
 
