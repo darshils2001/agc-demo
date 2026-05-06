@@ -564,18 +564,22 @@ done
 
 **What we're testing:** One benign request and two malicious ones (path-traversal payload, classic SQLi tautology), all hitting the same `GET /` path on contoso. AGC + Azure WAF inspects each one against the managed Default Rule Set 2.1 before forwarding.
 
-**What it shows:**
+**What WAF actually adds, in plain English:**
 
-- **WAF is what AGC unlocks for ACNS customers.** There's no DIY ingress path to native Azure WAF on AKS L7 ingress — choosing AGC for managed Gateway API gets you native WAF for free.
-- WAF on AGC uses the Azure-managed Default Rule Set 2.1 — same OWASP-class signatures as Front Door and standalone App Gateway WAF.
-- WAF runs at the **edge**; ACNS L7 runs at the **pod**. Two layers, two rule philosophies (signatures from the internet vs. behaviors from any source). Customers need both.
-- We wired this up in 3f — the `WebApplicationFirewallPolicy` CRD is `Programmed=True`, scoped Gateway-wide so all three tenants are protected.
+Up to this point, AGC has been doing host-based routing — it reads the `Host:` header and forwards every request to the right pod. WAF turns that same front door into a **metal detector**: AGC now opens up every incoming request and checks the URL, query string, headers, and body against a managed library of attack signatures (SQL injection, cross-site scripting, path traversal, command injection, the OWASP Top 10) before it forwards anything. If a request matches a known-bad pattern, AGC rejects it with a 403 and the pod never sees it.
+
+**Why this matters:**
+
+- **It's a managed service, not a project.** Microsoft writes the rules, tunes them, and keeps them current as new CVEs land. You don't maintain a ModSecurity ruleset, you don't tune false positives at 3am, you don't update signatures \u2014 it's the same managed Default Rule Set 2.1 that powers Front Door and standalone App Gateway WAF.
+- **It catches things ACNS cannot.** ACNS L7 enforces *behavior* (this method on this path is allowed). WAF enforces *content* (this query string contains a SQLi pattern). A malicious `GET /?id=1 OR 1=1` is still a `GET /` \u2014 ACNS would happily forward it because the method and path are whitelisted. WAF sees the payload and blocks it.
+- **It runs at the edge.** Malicious requests die at the AGC frontend, not at the pod. Your application code, your nginx, your business logic \u2014 none of it ever sees an attack signature. That's less attack surface, less log noise, less load on the cluster.
+- **It's two YAMLs.** One Azure WAF policy + one `WebApplicationFirewallPolicy` CRD bound to the Gateway. We wired this up in step 1 + step 2; right now it's `Programmed=True` and scoped Gateway-wide, so all three tenants are protected automatically.
 
 **Why both layers exist** (have this table on screen during the test):
 
 | Threat | AGC WAF (edge) | ACNS L7 (pod) |
 |---|---|---|
-| `?text=/etc/passwd` path-traversal payload from internet | **Blocks (DRS rule match)** | Wouldn't have triggered (path is `/`, method is GET — passes ACNS) |
+| `?text=/etc/passwd` path-traversal payload from internet | **Blocks (DRS rule match)** | Wouldn't have triggered (path is `/`, method is GET \u2014 passes ACNS) |
 | `POST /` from internet | Forwards (no WAF rule against bare POST) | **Blocks (method not in whitelist)** |
 | `POST /` from a *compromised pod inside the cluster* | Doesn't see it | **Blocks (4c will prove this)** |
 | Zero-day SQLi against `/products?id=...` | **Blocks (DRS pattern match)** | Wouldn't catch (path is allowed) |
@@ -620,6 +624,13 @@ malicious   GET /?id=1 OR 1=1           -> 403
 - Both `403`s came from **AGC**, not Cilium. ACNS L7 wouldn't have caught either — both are GETs to `/`, which is in the ACNS whitelist. Without WAF at the edge, both would have reached nginx.
 - AGC WAF caught the *signature-based* attack. ACNS L7 (in 4b) catches the *behavioral* attack. Two layers, two rule philosophies, both running automatically.
 - WAF runs in **Prevention** for prod, **Detection** for tuning. One CLI flag flips between them. Scope per-`HTTPRoute` to roll out per-tenant.
+
+**What WAF just did that we didn't have before:**
+
+- **It read the request body, not just the envelope.** In 4a, AGC looked at the `Host:` header and forwarded. Here, AGC opened up the URL and query string, scanned them against thousands of OWASP-class attack patterns, and rejected two of three. Same managed frontend, brand-new security capability.
+- **It blocked attacks ACNS would have let through.** Both malicious requests were `GET /` \u2014 ACNS's allow list says yes. WAF said no, because it inspects *content*, not just method and path. That's the gap WAF closes.
+- **The attack never touched the pod.** No CPU spent, no log entries on contoso, no chance for the request to find a zero-day in nginx or your app code. The 403 was rendered by the AGC frontend itself.
+- **You didn't write any rules.** The Default Rule Set 2.1 ships with the policy. Microsoft maintains it. Your job was two YAMLs (the Azure WAF policy in step 1, the `WebApplicationFirewallPolicy` CRD in step 2) \u2014 the rules came with the service.
 
 > **Verdict:** AGC brought traffic in **and stopped malicious traffic at the edge** with Azure WAF (DRS 2.1). ACNS never had to look at the request — it died one layer earlier. Outer perimeter / inner perimeter, working together.
 
