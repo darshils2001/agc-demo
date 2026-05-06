@@ -135,13 +135,6 @@ We're standing up a fake "shared cluster" that hosts three businesses. They're s
 
 Each tenant is one nginx pod listening on **port 8080** with site-specific HTML (`Hello from Contoso`, etc.) so we can read the response body and prove which backend served it. We don't actually own `*.example.com` — step 4 forges the `Host:` header with `curl --resolve $IP`.
 
-**Things to remember when you're running step 4:**
-
-- All four pods live in `$APP_NAMESPACE` (`agc-sites`). All Cilium policies and the WAF binding scope to that namespace / the Gateway.
-- **Labels matter.** Each tenant has `site: <name>` — that's what `allow-agc-l7-get-only` matches on. `client` has `app: client` — that's what `client-may-call-contoso-get-only` matches on. If a customer asks "how do I add a 4th tenant?" the answer is *one HTTPRoute + add the new value to the `site` selector*.
-- **Only `GET /` and `GET /products` are whitelisted** for the three tenants. Everything else returns 403 — that's the punchline of 4b.
-- **Only `client → contoso GET /` is whitelisted** east-west. `client → contoso POST` returns 403 (L7 deny). `client → fabrikam` times out as `000` (L4 deny — no policy whitelists this pair at all). That distinction is the punchline of 4c.
-
 **What this block does, at a glance:**
 
 One `kubectl apply` lays down every Kubernetes object the demo needs. Read the manifest as **six layers** stacked on top of each other:
@@ -163,6 +156,13 @@ One `kubectl apply` lays down every Kubernetes object the demo needs. Read the m
 | 2 | **`allow-dns-egress`** | Lets every pod make DNS lookups against kube-dns (port 53, the standard DNS port). | Without it nothing in Kubernetes works — service discovery, controllers, every client library breaks. The minimum carve-out you have to add. | 4e (nslookup succeeds) |
 | 3 | **`allow-agc-l7-get-only`** | The three tenant pods accept inbound on 8080, but only `GET /` and `GET /products`. Anything else is dropped with a Cilium-synthesized 403 before nginx ever sees it. | The **north-south** allow. This is what turns AGC's "any HTTP method gets in" into "only the methods the app actually serves get in." (Sources are `world` AND `cluster` because AGC traffic enters via a node-local hop tagged `cluster` — caught us during build.) | 4b (`POST /` → 403, `GET /products` → 404 from nginx) |
 | 4 | **`client-may-call-contoso-get-only`** | `client` pod is allowed to call `contoso` pod on `GET /` only. Nothing else east-west works. | The **east-west** allow. Cilium policies are additive — both source-egress AND destination-ingress must permit. That's why 4c gets three different verdicts (`200`, `403`, `000`) from three different policy interactions. | 4c (the three-verdict pod-to-pod test) |
+
+**Things to remember when you're running step 4:**
+
+- All four pods live in `$APP_NAMESPACE` (`agc-sites`). All Cilium policies and the WAF binding scope to that namespace / the Gateway.
+- **Labels matter.** Each tenant has `site: <name>` — that's what `allow-agc-l7-get-only` matches on. `client` has `app: client` — that's what `client-may-call-contoso-get-only` matches on. If a customer asks "how do I add a 4th tenant?" the answer is *one HTTPRoute + add the new value to the `site` selector*.
+- **Only `GET /` and `GET /products` are whitelisted** for the three tenants. Everything else returns 403 — that's the punchline of 4b.
+- **Only `client → contoso GET /` is whitelisted** east-west. `client → contoso POST` returns 403 (L7 deny). `client → fabrikam` times out as `000` (L4 deny — no policy whitelists this pair at all). That distinction is the punchline of 4c.
 
 **Operational note on WAF:** runs in **Prevention** for prod, **Detection** for tuning — one CLI flag flips between them. Can also be scoped per-`HTTPRoute` for per-tenant rollout.
 
