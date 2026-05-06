@@ -29,64 +29,6 @@ Hands-on-keyboard runbook. Paste each block into **Azure Cloud Shell** (<https:/
 
 ---
 
-## The picture (show this before running anything)
-
-```mermaid
-flowchart LR
-    user(["🌐 Internet user<br/>curl / browser"])
-    attacker(["🦹 Attacker<br/>SQLi, path traversal"])
-    bing(["🌍 bing.com<br/>(unauthorized egress)"])
-
-    subgraph AGC["🚪 AGC (Application Gateway for Containers) — managed ingress"]
-        waf["🛡️ Azure WAF<br/>DRS 2.1 — signature defense<br/>(4a-bonus)"]
-        gw["Gateway + 3 HTTPRoutes<br/>routes by Host header (4a)"]
-    end
-
-    subgraph AKS["☸️ AKS cluster — Cilium dataplane + ACNS L7"]
-        direction TB
-        subgraph NS["namespace: agc-sites"]
-            contoso["contoso<br/>pod"]
-            fabrikam["fabrikam<br/>pod"]
-            adventure["adventure<br/>pod"]
-            client["client<br/>(east-west caller)"]
-        end
-        cnp{{"4 CiliumNetworkPolicies<br/>• default-deny-all<br/>• allow-dns-egress<br/>• allow-agc-l7-get-only (4b)<br/>• client-may-call-contoso-get-only (4c)"}}
-    end
-
-    user -->|"GET / Host: contoso..."| waf
-    attacker -.->|"GET /?id=1' OR 1=1"| waf
-    waf -->|"clean traffic only"| gw
-    gw --> contoso
-    gw --> fabrikam
-    gw --> adventure
-
-    client -.->|"GET ✅ / POST ❌ (4c)"| contoso
-    contoso -.->|"egress denied (4d)"| bing
-    contoso -.->|"DNS allowed (4e)"| client
-
-    cnp -.enforces.-> contoso
-    cnp -.enforces.-> fabrikam
-    cnp -.enforces.-> adventure
-    cnp -.enforces.-> client
-
-    style waf fill:#ffe4b5,stroke:#d2691e,stroke-width:2px
-    style gw fill:#e0f2ff,stroke:#0078d4,stroke-width:2px
-    style cnp fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    style attacker stroke-dasharray: 5 5
-    style bing stroke-dasharray: 5 5
-```
-
-**Talking points to say while showing the diagram:**
-
-- **Two add-ons, two jobs.** Everything orange-and-blue at the top is **AGC** — Microsoft's managed ingress for Kubernetes. Everything green inside the cluster is **ACNS L7** — HTTP-aware policy that Cilium enforces at the eBPF datapath, on every single pod.
-- **Read it left to right and the story falls out.** Internet user hits AGC → WAF inspects the body for attack signatures → Gateway routes by Host header to the right tenant. That's **inbound** — and that whole left half is the AGC story (4a + 4a-bonus).
-- **Now look inside the cluster.** Once traffic gets *in*, ACNS takes over. The four CiliumNetworkPolicies in green apply to every pod in the namespace. They decide what HTTP methods are allowed in (4b), which pods can talk to which other pods and how (4c), what's allowed to leave the cluster (4d), and the surgical carve-out that keeps DNS working (4e).
-- **The dashed arrows are the "should fail" paths.** Attacker traffic dies at WAF. Outbound to bing.com dies at Cilium. Wrong HTTP methods between pods die at Cilium. Solid arrows are the "should succeed" paths — clean traffic to the right tenant, allowed east-west call, DNS lookups.
-- **Why this combination matters.** AGC alone gets you in but doesn't tell you what happens once you're inside. Cilium policies alone protect the pods but don't give you a managed front door with WAF, TLS, or a public IP. **You need both, and they compose without overlapping** — that's the whole pitch.
-- **Step 4 walks the diagram.** 4a is the top half, 4a-bonus adds WAF, 4b–4e are the green half. By the end you'll have run a request that touches every box on this picture.
-
----
-
 ## 1. Set up Azure (variables, providers, AKS cluster, WAF policy)
 
 **What this block does, at a glance:**
@@ -104,12 +46,6 @@ When this finishes, you have an empty AKS cluster with both add-ons installed an
 
 - `--enable-acns --acns-advanced-networkpolicies L7` → turns on **Cilium L7** (HTTP-aware policy: method, path, headers). This is what makes 4b–4e work.
 - `--enable-application-load-balancer` → installs the **AGC** add-on (controller, workload identity, delegated subnet — all auto-provisioned). This is what makes 4a possible.
-
-**Three things worth knowing** while the cluster builds:
-
-- **L7 is preview-gated.** `AdvancedNetworkingPreview` must be registered or the L7 flag above is rejected. The four resource providers cover AKS, VNets, the AGC backend (`ServiceNetworking`), and ACNS telemetry.
-- **WAF gets a CLI dance.** AGC WAF only supports DRS 2.1, but `waf-policy create` only accepts OWASP. We create with OWASP, then atomically swap the rule set to DRS 2.1 (and flip to Prevention/Enabled) in one update. The bash handles this for you.
-- **The role assignment is mandatory.** The ALB Controller's managed identity needs `Network Contributor` on the WAF policy to attach it from the Kubernetes side. Without it, the WAF CRD fails with `LinkedAuthorizationFailed`. The MI naming varies by add-on version (`applicationloadbalancer-*` for GA, `azurealb-*` for older preview), so the script matches either.
 
 Cluster create is the only slow step (~7 min). Everything else is fast.
 
