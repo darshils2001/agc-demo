@@ -483,6 +483,129 @@ kubectl get cnp -n $APP_NAMESPACE
 
 All 4 should show `VALID=True`.
 
+### 3f. Azure WAF policy on the AGC Gateway
+
+**Talking points:**
+- WAF is part of the *setup* — we want it programmed and `Programmed=True` before we start the demo, so step 4a-bonus is just two `curl`s, not a 5-minute role-assignment side-quest.
+- Two pieces of wiring: an **Azure WAF policy** resource that holds the rules (managed Default Rule Set 2.1 — same OWASP-class signatures as Front Door / standalone App Gateway WAF), and a **Kubernetes-side `WebApplicationFirewallPolicy` CRD** that points the ALB Controller at it.
+- We scope the CRD to the whole Gateway, so all three tenants (contoso, fabrikam, adventure) are protected by the same WAF policy.
+- The ALB Controller's managed identity needs `Network Contributor` on the WAF policy resource — without it, the CRD sits in `DeploymentFailed` with `LinkedAuthorizationFailed`.
+
+> **Why we use a single atomic `update --set managedRules...`:** AGC WAF *only* supports `Microsoft_DefaultRuleSet` (DRS) 2.1 — no OWASP, no Bot Manager. But `az ... waf-policy create` requires `--type/--version` and only accepts OWASP. You cannot fix this with two separate calls (`remove OWASP` then `add DRS`) because:
+> - `remove OWASP` fails with `NoValidPrimaryRuleSetsAttached` (a policy must always have one primary ruleset)
+> - `add DRS` fails with `HasMultiplePrimaryRuleSets` (can't add a second one)
+>
+> So we create with the forced OWASP, then **swap the entire `managedRuleSets` array atomically** in a single `update`.
+
+```bash
+# 1a. Create the policy IF it doesn't already exist. We make this idempotent because
+#     `az ... waf-policy create` is an upsert — re-running it on an existing policy that's
+#     already attached to AGC will re-send `--type OWASP --version 3.2` and get rejected
+#     with `ApplicationGatewayFirewallAttachAGCUnsupportedRuleSetVersion`. So: only create
+#     if missing. The `update` calls below are themselves idempotent.
+if ! az network application-gateway waf-policy show \
+      --name agc-waf-policy --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
+  az network application-gateway waf-policy create \
+    --name agc-waf-policy \
+    --resource-group "$RESOURCE_GROUP" \
+    --location "$LOCATION" \
+    --type OWASP --version 3.2
+else
+  echo "WAF policy agc-waf-policy already exists — skipping create."
+fi
+
+# 1b. Atomically replace OWASP 3.2 with DRS 2.1 (the only ruleset AGC WAF supports) in one update.
+az network application-gateway waf-policy update \
+  --name agc-waf-policy --resource-group "$RESOURCE_GROUP" \
+  --set "managedRules.managedRuleSets=[{\"ruleSetType\":\"Microsoft_DefaultRuleSet\",\"ruleSetVersion\":\"2.1\",\"ruleGroupOverrides\":[]}]"
+
+# 1c. Set the policy to Prevention/Enabled.
+az network application-gateway waf-policy update \
+  --name agc-waf-policy --resource-group "$RESOURCE_GROUP" \
+  --set policySettings.mode=Prevention policySettings.state=Enabled
+
+# 1d. Sanity check — should show only Microsoft_DefaultRuleSet 2.1.
+az network application-gateway waf-policy show \
+  --name agc-waf-policy --resource-group "$RESOURCE_GROUP" \
+  --query 'managedRules.managedRuleSets'
+
+WAF_ID=$(az network application-gateway waf-policy show \
+  --name agc-waf-policy --resource-group "$RESOURCE_GROUP" --query id -o tsv)
+echo "$WAF_ID"
+
+# 1e. Grant the ALB Controller's managed identity permission to "join" the WAF policy.
+#     Without this, the CRD will sit in DeploymentFailed with LinkedAuthorizationFailed
+#     ("does not have permission to perform 'microsoft.network/applicationgatewaywebapplicationfirewallpolicies/join/action'").
+#     The ALB Controller add-on creates a managed identity in the AKS node RG. Naming varies
+#     across add-on versions (`azurealb-*`, `<aks>-agentpool`, etc.), so we list and pick.
+NODE_RG=$(az aks show -g "$RESOURCE_GROUP" -n "$AKS_NAME" --query nodeResourceGroup -o tsv)
+echo "Node RG: $NODE_RG"
+echo "Identities in node RG:"
+az identity list -g "$NODE_RG" --query "[].{name:name,principalId:principalId}" -o table
+
+# Pick the ALB controller identity. Naming varies across add-on versions:
+#   - `applicationloadbalancer-<aks>` (current GA naming, e.g. applicationloadbalancer-agcdemo-aks)
+#   - `azurealb-<aks>` (older preview naming)
+# We match either pattern. If neither matches, set it manually from the table above.
+ALB_PRINCIPAL_ID=$(az identity list -g "$NODE_RG" \
+  --query "[?starts_with(name, 'applicationloadbalancer') || starts_with(name, 'azurealb')].principalId | [0]" -o tsv)
+
+# If empty, set it manually from the table above (the ALB controller identity is the one
+# whose name starts with `applicationloadbalancer-` or `azurealb-`):
+# ALB_PRINCIPAL_ID=<paste-objectid-here>
+echo "ALB Controller identity: $ALB_PRINCIPAL_ID"
+
+az role assignment create \
+  --assignee-object-id "$ALB_PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Network Contributor" \
+  --scope "$WAF_ID"
+
+# 2. Bind it to our Gateway via the ALB Controller's WebApplicationFirewallPolicy CRD.
+kubectl apply -f - <<EOF
+apiVersion: alb.networking.azure.io/v1
+kind: WebApplicationFirewallPolicy
+metadata:
+  name: agc-gateway-waf
+  namespace: $APP_NAMESPACE
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: gateway-01
+    namespace: $APP_NAMESPACE
+  webApplicationFirewall:
+    id: $WAF_ID
+EOF
+
+# 3. Wait for the controller to reconcile, then confirm Programmed=True.
+sleep 30
+kubectl get webapplicationfirewallpolicy -n $APP_NAMESPACE agc-gateway-waf \
+  -o jsonpath='{.status.conditions[?(@.type=="Programmed")]}{"\n"}'
+```
+
+> **If you applied the CRD before the role assignment** (or had any other permission issue at first reconcile), the controller caches the failure on the CRD. Force a re-reconcile by deleting and re-applying:
+>
+> ```bash
+> kubectl delete webapplicationfirewallpolicy -n $APP_NAMESPACE agc-gateway-waf
+> # then re-run the kubectl apply block above
+> ```
+
+**Expected output:**
+
+```text
+/subscriptions/.../resourceGroups/5-4-agc-demo/providers/Microsoft.Network/applicationGatewayWebApplicationFirewallPolicies/agc-waf-policy
+webapplicationfirewallpolicy.alb.networking.azure.io/agc-gateway-waf created
+...
+status:
+  conditions:
+  - reason: Programmed
+    status: "True"
+    type: Programmed
+```
+
+`Programmed=True` is your green light. WAF is now live on the Gateway. Step 4a-bonus is just two `curl`s.
+
 ---
 
 ## 4. Test it — the actual demo
@@ -604,133 +727,12 @@ AGC WAF stops signature-based attacks from the internet. ACNS L7 stops behaviora
 - "Stepping back — we've shown AGC routing and ACNS enforcement. Now we're lighting up the third leg: **AGC's built-in Azure WAF.**"
 - "The line worth remembering: **WAF is what AGC unlocks for ACNS customers.** No AGC, no native WAF."
 - "WAF on AGC uses the Azure-managed Default Rule Set 2.1 — same OWASP-class signatures as Front Door and standalone App Gateway WAF."
-- "The wiring is two pieces: an Azure WAF policy resource that holds the rules, and a `WebApplicationFirewallPolicy` CRD that points the ALB Controller at it. We'll scope it to the whole Gateway so all three tenants are protected."
+- "We already wired this up in 3f — the `WebApplicationFirewallPolicy` CRD is `Programmed=True`, scoped to the whole Gateway so all three tenants are protected."
 - "Watch the response codes. `200` for the legit request, `403` for the malicious one — and the 403 here is from **AGC**, not Cilium."
 
-**Setup — create the Azure WAF policy and bind it via the CRD:**
+**Now run the actual test — one benign request, two malicious:**
 
-> **Why we use a single atomic `update --set managedRules...`:** AGC WAF *only* supports `Microsoft_DefaultRuleSet` (DRS) 2.1 — no OWASP, no Bot Manager. But `az ... waf-policy create` requires `--type/--version` and only accepts OWASP. You cannot fix this with two separate calls (`remove OWASP` then `add DRS`) because:
-> - `remove OWASP` fails with `NoValidPrimaryRuleSetsAttached` (a policy must always have one primary ruleset)
-> - `add DRS` fails with `HasMultiplePrimaryRuleSets` (can't add a second one)
->
-> So we create with the forced OWASP, then **swap the entire `managedRuleSets` array atomically** in a single `update`.
-
-```bash
-# 1a. Create the policy IF it doesn't already exist. We make this idempotent because
-#     `az ... waf-policy create` is an upsert — re-running it on an existing policy that's
-#     already attached to AGC will re-send `--type OWASP --version 3.2` and get rejected
-#     with `ApplicationGatewayFirewallAttachAGCUnsupportedRuleSetVersion`. So: only create
-#     if missing. The `update` calls below are themselves idempotent.
-if ! az network application-gateway waf-policy show \
-      --name agc-waf-policy --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
-  az network application-gateway waf-policy create \
-    --name agc-waf-policy \
-    --resource-group "$RESOURCE_GROUP" \
-    --location "$LOCATION" \
-    --type OWASP --version 3.2
-else
-  echo "WAF policy agc-waf-policy already exists — skipping create."
-fi
-
-# 1b. Atomically replace OWASP 3.2 with DRS 2.1 (the only ruleset AGC WAF supports) in one update.
-az network application-gateway waf-policy update \
-  --name agc-waf-policy --resource-group "$RESOURCE_GROUP" \
-  --set "managedRules.managedRuleSets=[{\"ruleSetType\":\"Microsoft_DefaultRuleSet\",\"ruleSetVersion\":\"2.1\",\"ruleGroupOverrides\":[]}]"
-
-# 1c. Set the policy to Prevention/Enabled.
-az network application-gateway waf-policy update \
-  --name agc-waf-policy --resource-group "$RESOURCE_GROUP" \
-  --set policySettings.mode=Prevention policySettings.state=Enabled
-
-# 1d. Sanity check — should show only Microsoft_DefaultRuleSet 2.1.
-az network application-gateway waf-policy show \
-  --name agc-waf-policy --resource-group "$RESOURCE_GROUP" \
-  --query 'managedRules.managedRuleSets'
-
-WAF_ID=$(az network application-gateway waf-policy show \
-  --name agc-waf-policy --resource-group "$RESOURCE_GROUP" --query id -o tsv)
-echo "$WAF_ID"
-
-# 1e. Grant the ALB Controller's managed identity permission to "join" the WAF policy.
-#     Without this, the CRD will sit in DeploymentFailed with LinkedAuthorizationFailed
-#     ("does not have permission to perform 'microsoft.network/applicationgatewaywebapplicationfirewallpolicies/join/action'").
-#     The ALB Controller add-on creates a managed identity in the AKS node RG. Naming varies
-#     across add-on versions (`azurealb-*`, `<aks>-agentpool`, etc.), so we list and pick.
-NODE_RG=$(az aks show -g "$RESOURCE_GROUP" -n "$AKS_NAME" --query nodeResourceGroup -o tsv)
-echo "Node RG: $NODE_RG"
-echo "Identities in node RG:"
-az identity list -g "$NODE_RG" --query "[].{name:name,principalId:principalId}" -o table
-
-# Pick the ALB controller identity. Naming varies across add-on versions:
-#   - `applicationloadbalancer-<aks>` (current GA naming, e.g. applicationloadbalancer-agcdemo-aks)
-#   - `azurealb-<aks>` (older preview naming)
-# We match either pattern. If neither matches, set it manually from the table above.
-ALB_PRINCIPAL_ID=$(az identity list -g "$NODE_RG" \
-  --query "[?starts_with(name, 'applicationloadbalancer') || starts_with(name, 'azurealb')].principalId | [0]" -o tsv)
-
-# If empty, set it manually from the table above (the ALB controller identity is the one
-# whose name starts with `applicationloadbalancer-` or `azurealb-`):
-# ALB_PRINCIPAL_ID=<paste-objectid-here>
-echo "ALB Controller identity: $ALB_PRINCIPAL_ID"
-
-az role assignment create \
-  --assignee-object-id "$ALB_PRINCIPAL_ID" \
-  --assignee-principal-type ServicePrincipal \
-  --role "Network Contributor" \
-  --scope "$WAF_ID"
-
-# 2. Bind it to our Gateway via the ALB Controller's WebApplicationFirewallPolicy CRD.
-kubectl apply -f - <<EOF
-apiVersion: alb.networking.azure.io/v1
-kind: WebApplicationFirewallPolicy
-metadata:
-  name: agc-gateway-waf
-  namespace: $APP_NAMESPACE
-spec:
-  targetRef:
-    group: gateway.networking.k8s.io
-    kind: Gateway
-    name: gateway-01
-    namespace: $APP_NAMESPACE
-  webApplicationFirewall:
-    id: $WAF_ID
-EOF
-
-# 3. Wait for the controller to reconcile, then confirm Programmed=True.
-sleep 30
-kubectl get webapplicationfirewallpolicy -n $APP_NAMESPACE agc-gateway-waf \
-  -o jsonpath='{.status.conditions[?(@.type=="Programmed")]}{"\n"}'
-```
-
-> **If you applied the CRD before the role assignment** (or had any other permission issue at first reconcile), the controller caches the failure on the CRD. Force a re-reconcile by deleting and re-applying:
->
-> ```bash
-> kubectl delete webapplicationfirewallpolicy -n $APP_NAMESPACE agc-gateway-waf
-> # then re-run the kubectl apply block above
-> ```
-
-> **If kubectl prints `the server has asked for the client to provide credentials`** \u2014 your Cloud Shell session lost the AKS cluster credentials (common after an idle disconnect). Re-run:
->
-> ```bash
-> az aks get-credentials -g "$RESOURCE_GROUP" -n "$AKS_NAME" --overwrite-existing
-> ```
-
-**Expected setup output:**
-
-```text
-/subscriptions/.../resourceGroups/5-4-agc-demo/providers/Microsoft.Network/applicationGatewayWebApplicationFirewallPolicies/agc-waf-policy
-webapplicationfirewallpolicy.alb.networking.azure.io/agc-gateway-waf created
-...
-status:
-  conditions:
-  - reason: Programmed
-    status: "True"
-    type: Programmed
-```
-
-**Now run the actual test — one benign request, one malicious:**
-
-> **If you're in a fresh Cloud Shell tab**, re-export `$APP_NAMESPACE` and re-derive `$IP` first, otherwise curl returns `000` (no DNS / empty `--resolve`):
+> **If you're running this in a *fresh Cloud Shell tab* (e.g., the one you opened for `cilium monitor` in step 5), `$APP_NAMESPACE` and `$IP` won't be set.** Cloud Shell doesn't share environment variables between tabs — each tab is its own bash process with its own environment. The block below re-exports the namespace and re-derives the AGC FQDN+IP so `curl --resolve` has something to pin to. The `dig` fallback covers the case where `getent` returns empty (happens occasionally in Cloud Shell).
 >
 > ```bash
 > export APP_NAMESPACE="agc-sites"
