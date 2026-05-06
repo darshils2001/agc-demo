@@ -740,15 +740,14 @@ client->fabrikam     -> 000
 |---|---|---|---|
 | **4d** Backend pod → bing.com | **ACNS** default-deny egress | `default-deny-all` CNP at the pod | East-west out: pod → internet |
 
-**What we're testing:** A backend pod (contoso) tries to `wget https://www.bing.com`. ACNS's `default-deny-all` should drop the connection silently.
+**What we're testing:** Up to this point everything we've shown is about traffic coming **in** to the cluster — AGC routing requests in (4a), ACNS deciding which methods are allowed in (4b), and one pod calling another pod inside the cluster (4c). Now we flip the direction. We're going to `exec` into a backend pod (contoso) and have it try to reach the public internet — `wget https://www.bing.com`. The expectation: it should fail, and fail *silently*.
 
 **What it shows:**
 
-- This is the inverse of 4b/4c — we've been controlling traffic *coming in* to pods. Now we're controlling traffic *going out*.
-- ACNS owns the egress dimension. With it, you decide exactly which destinations workloads can reach.
-- Almost every modern attack on Kubernetes ends with the compromised pod calling out — exfiltration, second-stage payload download, C2 callback. Cutting egress breaks the attack chain.
-- Cilium silent-drops the SYN at the kernel — no RST, no ICMP unreachable, just a hung connection that eventually times out. From the attacker's perspective the network is a black hole, and that ambiguity is itself a defense.
-- The pattern is the customer's explicit ask: *allow only the controller endpoints, deny everything else.* Specific outbound destinations would be added with `toFQDNs: [matchName: 'api.vendor.com']` rules.
+- **This is the egress story.** Inbound is only half of zero-trust. The other half is: *if a pod gets compromised, can it phone home?* That's what we're testing.
+- **Why egress matters so much.** Almost every modern Kubernetes attack ends the same way — the compromised pod calls out. Data exfiltration, downloading a second-stage payload, beaconing to a command-and-control server. If you cut egress, you break the attack chain even after the pod is owned.
+- **Who's enforcing this.** AGC has nothing to do with outbound traffic — it only knows about requests coming in. ACNS owns this dimension entirely. The `default-deny-all` CiliumNetworkPolicy says *no pod talks to anything by default*, and we've only carved out two exceptions: DNS (so pods can resolve names) and the specific contoso → fabrikam call from 4c.
+- **Why "silent" matters.** Cilium drops the connection at the kernel — no TCP reset, no ICMP unreachable, no helpful error. The pod just hangs until it times out. To an attacker this looks like a network black hole, which is itself a defense — they can't tell if the destination is blocked, down, or doesn't exist.
 
 ```bash
 CONTOSO=$(kubectl get pod -n $APP_NAMESPACE -l app=contoso -o jsonpath='{.items[0].metadata.name}')
@@ -766,10 +765,12 @@ rc=1  (non-zero = blocked)
 
 **What the output means:**
 
-- **DNS still resolves.** `getaddrinfo("www.bing.com")` succeeded — kube-dns was reached via `allow-dns-egress`. So this isn't "the cluster is broken," it's "the cluster is locked down with a DNS carve-out."
-- **The TCP connection to bing's IP silently times out.** Cilium drops the SYN at the kernel level — no RST, no ICMP unreachable, no useful error. After 5s wget gives up. This is Cilium's documented default-deny behavior ([silent drop](https://docs.cilium.io/en/latest/security/policy/intro/#policy-deny-response-handling)).
-- **`rc=1`** is the application-visible result. **If a workload were exfiltrating data, this is what stops it.** The attacker doesn't even get a useful error code to retry against.
-- **ACNS owns the egress dimension entirely.** Pod → internet traffic is governed by Cilium policies at the eBPF datapath.
+Read the three lines top to bottom — they tell the whole story:
+
+- **DNS resolution worked.** The fact that `wget` got past the name-lookup step and started trying to connect tells you kube-dns was reachable. That's our `allow-dns-egress` carve-out doing its job. So this is not "the cluster is broken" — it's "the cluster is locked down, with DNS deliberately allowed."
+- **The TCP connection went nowhere.** `wget` got an IP for bing.com and sent a SYN packet. Cilium dropped it at the eBPF datapath. No reset, no ICMP error, no "connection refused" — just nothing. After 5 seconds wget gave up: `download timed out`. This is Cilium's documented [silent-drop behavior](https://docs.cilium.io/en/latest/security/policy/intro/#policy-deny-response-handling) for default-deny.
+- **`rc=1` is the punchline.** That non-zero exit code is what the workload sees. **If this pod were compromised and trying to exfiltrate data, this is the moment the attack dies.** No data leaves. The attacker doesn't even get a useful error to retry against — just a black hole.
+- **Notice what's enforcing this.** Not AGC. Not a firewall sitting outside the cluster. Cilium, in-kernel, on the same node as the pod. The decision is made before the packet ever leaves the host.
 
 > **Verdict:** ACNS denied the TCP connection silently at the eBPF datapath because no egress allow rule whitelists the public internet.
 
