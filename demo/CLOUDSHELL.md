@@ -678,14 +678,14 @@ GET /admin -> 403
 
 **What the output means, line by line:**
 
-| Line | Who decided | What happened | Why it matters |
-|---|---|---|---|
-| `GET / -> 200` | nginx | AGC routed → ACNS allowed (`GET /` in whitelist) → nginx served the page | The happy path. Customers' actual users see this. |
-| `POST / -> 403` | **ACNS** | AGC routed → **ACNS rejected the method** → nginx never saw it | Same port as GET. Vanilla L4 NetworkPolicy could not block this. |
-| `PUT / -> 403` | **ACNS** | Same as POST | Default-deny on methods. Only GET is whitelisted. |
-| `DELETE / -> 403` | **ACNS** | Same as POST | Method-level enforcement at the pod boundary. |
-| `GET /products -> 404` | **nginx** | AGC routed → ACNS *allowed* (`/products` in whitelist) → nginx had no such file → returned 404 | **The proof point.** 404 means the request reached the app. ACNS is doing real L7 inspection, not blanket-blocking. |
-| `GET /admin -> 403` | **ACNS** | AGC routed → **ACNS rejected the path** → nginx never saw `/admin` | The bouncer at the door rejected it. nginx never knew it was coming. |
+| Line | Who decided | What happened | Why it happened | Why it matters |
+|---|---|---|---|---|
+| `GET / -> 200` | nginx | AGC routed → ACNS allowed → nginx served the page | `GET /` is one of the two paths whitelisted in `allow-agc-l7-get-only`, so Cilium's L7 proxy passed it through and nginx served the homepage normally. | The happy path. Customers' actual users see this. |
+| `POST / -> 403` | **ACNS** | AGC routed → **ACNS rejected the method** → nginx never saw it | Same path, different verb. The whitelist only allows `GET`, so Cilium's L7 proxy synthesized a `403` itself before the request ever reached nginx. | Same port as GET. Vanilla L4 NetworkPolicy could not block this. |
+| `PUT / -> 403` | **ACNS** | Same as POST | Same reason as POST — `PUT` isn't on the whitelist, so it's denied at the pod boundary. | Default-deny on methods. Only GET is whitelisted. |
+| `DELETE / -> 403` | **ACNS** | Same as POST | Same reason as POST — `DELETE` isn't on the whitelist either. | Method-level enforcement at the pod boundary. |
+| `GET /products -> 404` | **nginx** | AGC routed → ACNS *allowed* → nginx had no such file → returned 404 | `GET /products` is on the whitelist, so Cilium passed it through. nginx itself doesn't have a `/products` page in this demo, so *nginx* returned the 404 — proving the request actually reached the app. | **The proof point.** 404 means the request reached the app. ACNS is doing real L7 inspection, not blanket-blocking. |
+| `GET /admin -> 403` | **ACNS** | AGC routed → **ACNS rejected the path** → nginx never saw `/admin` | Same method as the 200 case, but `/admin` isn't on the whitelist. Cilium denied it at the pod door — nginx never knew the request existed. | The bouncer at the door rejected it. nginx never knew it was coming. |
 
 **The 403-vs-404 distinction is the headline.** Anyone can build "deny everything." Showing *"allow this method on this path, deny that method on that path, pass the rest untouched all the way to the app"* — with the responses coming from different layers depending on the rule — is the unique value of AGC + ACNS L7.
 
