@@ -450,11 +450,28 @@ All 4 should show `VALID=True`.
 
 ---
 
-## 4. Test it
+## 4. Test it — the actual demo
 
-**This is the demo.** Each subsection proves one of the four-step requirements is enforced. Read the "Expected output" block aloud *before* running so the audience knows what to watch for, then read the "What it proves" block *after*.
+**Setup is over. From here on, every command demonstrates a customer-facing behavior of AGC and ACNS.** This is the section the audience came for. Don't rush it. Spend the time on the *narration* of each test, not on getting through them.
 
-**Mental model for the next ten tests** — keep this on screen the whole time:
+### The arc of step 4 in one paragraph
+
+> *The setup phase built two things: an Azure-managed L7 load balancer (AGC) wired to three sample tenants, and a set of Cilium L7 policies (ACNS) clamped down on every pod inside the cluster. Step 4 proves both layers are doing exactly what we said they would. **4a shows AGC doing its only job — routing internet traffic into the cluster.** **4b–4e show ACNS doing its only job — deciding what traffic, from any source, is allowed to flow inside the cluster.** AGC is the front door. ACNS is the security guard at every interior door. The two never overlap, and customers get both for free when they enable the AGC add-on with ACNS L7.*
+
+### How to run each test
+
+Each `### 4x.` subsection has the same shape, intentionally:
+
+1. **Mini context table** — reminds the audience which layer this test exercises.
+2. **The story in one line** — the headline.
+3. **AGC's role / ACNS's role** — one sentence each, explicit, so the audience never has to guess which product just did the thing.
+4. **Talking points** — read these bullets out loud while you're typing the command. They are the things you want the audience to hear.
+5. **The command.**
+6. **Expected output.**
+7. **What it proves** — read this *after* the command finishes, ideally pointing at specific lines on screen.
+8. **The takeaway** — the one sentence to repeat back to the customer.
+
+### Mental model for the next ten tests — keep this on screen the whole time:
 
 | Tests | Layer being demonstrated | What's enforcing | Direction |
 |---|---|---|---|
@@ -467,7 +484,9 @@ All 4 should show `VALID=True`.
 
 > **One sentence to repeat at the start of step 4:** *"AGC is what brought the request into the cluster — you'll see that work in 4a. From 4b onward, ACNS L7 controls what happens to that request once it's inside the cluster: north-south *behind* AGC (4b), pod-to-pod east-west (4c), and outbound (4d/4e)."*
 
-First grab the AGC FQDN and resolve it once — every test below pins to this IP via `curl --resolve`, since we don't own `*.example.com`:
+### Set up the test variables
+
+Grab the AGC FQDN once — every test below pins to this IP via `curl --resolve`, since we don't own `*.example.com`:
 
 ```bash
 FQDN=$(kubectl get gateway gateway-01 -n $APP_NAMESPACE -o jsonpath='{.status.addresses[0].value}')
@@ -487,15 +506,25 @@ dae7c5atdqguhwa0.fz13.alb.azure.com -> 20.238.208.7
 - `IP` populated → public DNS already resolves the AGC hostname (Azure publishes it the moment AGC is ready).
 - `20.x` is a Microsoft-owned range. Always use the FQDN in real configs — the IP is Azure-managed and can change.
 
-### 4a. Multi-site routing
+### 4a. Multi-site routing — AGC bringing traffic *into* the cluster
 
 | Tests | Layer | What's enforcing | Direction |
 |---|---|---|---|
 | **4a** Multi-site routing | **AGC** (the front door) | Gateway API `HTTPRoute` hostname matching on the AGC frontend | North-south: internet → cluster |
 
-**Proves step 3 of the ask. This is the AGC half — traffic *into* the cluster.** One frontend FQDN, three different responses based on the Host header. The `<h1>Hello from <site></h1>` line shows which backend pod actually served the request — so you know AGC routed by hostname, didn't just default-backend everything.
+**The story in one line:** One AGC public FQDN, three different hostnames, three different backend pods — AGC routes each request to the right tenant based purely on the `Host:` header.
 
-**The AGC framing for this test:** *"Everything happening in 4a is AGC's job. AGC is the only Azure resource a packet from the internet touches before it lands on a pod. North-south traffic is its world. Notice: one public IP, three tenants, routed purely by Host header — that's Gateway API multi-site working as designed."*
+**AGC's role here:** **everything.** AGC is the only Azure resource a packet from the internet touches. It terminates the connection at the edge, reads the `Host:` header, looks up which `HTTPRoute` claims that hostname, and forwards to the matching backend pod. This is what we mean by "AGC brings traffic *into* the cluster."
+
+**ACNS's role here:** *passive.* The L7 policy `allow-agc-l7-get-only` is whitelisting `GET /` on the destination pods, which is why the requests actually complete — but the policy doesn't *route* anything; it just permits or denies what AGC delivers. In 4a we're seeing the permitted path; in 4b we'll see ACNS reject the non-permitted ones.
+
+**Talking points** (read out loud while typing the command):
+
+- "Watch the IP we resolve to — it's the same `$IP` for every host. **One public IP, three tenants.** That's the canonical AGC multi-site shot."
+- "The only difference between these three requests is the `--resolve` line, which forges a different `Host:` header on each one. AGC reads that header and picks the backend."
+- "There's no per-tenant Azure resource. Three sites, one AGC. Adding a fourth tenant is one more `HTTPRoute` YAML — zero Azure-side work."
+- "This is the workflow customers replace with AGC: instead of a DIY ingress controller running on cluster nodes, they get a managed Azure load balancer with Gateway API as the API surface."
+- "What the audience should remember from 4a: AGC is the front door. Public IP, hostname routing, TLS termination (would-be), HTTP/2 — all the standard L7 gateway features, except it's Azure-managed and Gateway-API-native."
 
 ```bash
 for h in contoso fabrikam adventure; do
@@ -520,20 +549,36 @@ done
 
 **What it proves:**
 
-- **One AGC frontend, one public IP, three tenants.** All three requests hit the same `$IP`; the only difference is the `Host:` header set by `curl --resolve`.
-- **Gateway API multi-site is real.** Each `HTTPRoute` matched its hostname and routed to the right Service. Adding a fourth site is one more `HTTPRoute`, no Azure-side change.
-- **The L7 allow rule lets `GET /` through.** This is the happy path — the thing customers actually want their users to do.
-- **This is the AGC headline shot.** *One FQDN, three independent websites, zero infrastructure reconfiguration.*
+- **AGC is doing the routing.** Same public IP serves all three; only the `Host:` header differs. That's L7 hostname-based routing on the AGC frontend.
+- **Three independent tenants behind one frontend.** The `<h1>Hello from <site></h1>` in each response confirms a different backend pod served the request.
+- **Gateway API is the customer-facing surface.** Three `HTTPRoute` objects, written in upstream Kubernetes API, drove this. No AGC-specific YAML in the app team's hands.
+- **The L7 allow rule lets `GET /` through.** ACNS is silently waving these through because they match the whitelist. We'll see it actively *deny* in 4b.
 
-### 4b. Cilium L7 (GET allowed, POST denied)
+> **Verdict:** AGC brought traffic in (host-based routing on a single public IP). ACNS allowed it through (`GET /` is in the whitelist).
+
+**The takeaway to repeat to the customer:** *"With one flag at cluster create time and one Gateway+HTTPRoute YAML, AGC gives you a managed multi-tenant L7 frontend that's invisible to your app teams. This is the canonical pattern customers ship to prod."*
+
+### 4b. ACNS L7 — deciding what traffic is *allowed* once it's inside
 
 | Tests | Layer | What's enforcing | Direction |
 |---|---|---|---|
 | **4b** GET vs POST/PUT/DELETE, /products vs /admin | **ACNS L7** (the bouncer at the pod door) | `CiliumNetworkPolicy` L7 rules at the contoso/fabrikam/adventure pod | North-south *behind* AGC: AGC → pod |
 
-**Proves step 1 (L7 policy) AND the inbound half of step 4. The story shifts here: AGC got us *into* the cluster, ACNS now controls what happens *within* it.** This is the punch line of the entire demo — the difference between L4 ("port 80 is allowed") and L7 ("GET on port 80 is allowed, POST is not").
+**The story in one line:** AGC will happily forward *any* HTTP method on *any* path — it's a load balancer, not a security product. ACNS L7 is what decides which of those requests actually gets to nginx.
 
-**Hand-off line from 4a to 4b:** *"AGC just forwarded every one of those requests, no questions asked — that's its job. Watch what the bouncer at the pod door (ACNS L7) does to the bad ones. Same destination, same port, but the verb and path now matter."*
+**AGC's role here:** *unchanged from 4a.* AGC forwards **every single one** of these seven requests to the contoso pod. AGC didn't drop the POST. AGC didn't drop `/admin`. From AGC's perspective, all seven were valid requests to a known backend.
+
+**ACNS's role here:** **everything.** Once each request lands at the pod's network namespace, Cilium's L7 proxy parses the HTTP, checks the method-and-path against `allow-agc-l7-get-only`, and either forwards to nginx (`GET /`, `GET /products`) or returns a synthetic `403` itself (`POST /`, `PUT /`, `DELETE /`, `GET /admin`). **nginx never sees the denied requests.** This is what "ACNS controls how traffic flows within the cluster" looks like: at every pod, on every direction, with HTTP-method precision.
+
+**Talking points** (read out loud while typing the command):
+
+- "In 4a, AGC routed traffic in. In 4b we're going to ask AGC to route some traffic that *shouldn't* succeed — and watch ACNS do its job."
+- "All seven of these requests go through AGC. AGC doesn't filter by method or path — it forwards everything to the pod. AGC is **not** the security boundary here."
+- "The security boundary is ACNS L7 at the pod. Cilium has an HTTP-aware proxy in the eBPF dataplane. It parses the actual HTTP method and path, then makes a decision."
+- "Watch for two specific lines in the output: `POST / -> 403` and `GET /products -> 404`. Those two lines are the entire point of the demo."
+- "`POST / -> 403`: Cilium **synthesized** that 403 itself. nginx was never reached. The 403 response bytes the client got were written by Cilium, not by the app."
+- "`GET /products -> 404`: Cilium **let this one through** because `/products` is in the allow list. nginx received it, looked for a `/products` file, didn't find one, returned 404. **The 404 is from the app; the 403 is from Cilium.** That distinction is how I prove ACNS is doing actual L7 inspection instead of blanket-blocking."
+- "A vanilla Kubernetes NetworkPolicy could *not* produce these results. It can only allow or deny port 8080 wholesale. ACNS L7 lets you say 'GET on 8080 is allowed, POST on 8080 is not' — same port, different verb, different verdict."
 
 ```bash
 for m in GET POST PUT DELETE; do
@@ -560,26 +605,43 @@ GET /admin -> 403
 
 **What it proves, line by line:**
 
-| Line | What happened | Why |
-|---|---|---|
-| `GET / -> 200` | AGC routed → Cilium L7 proxy matched `GET /` rule → forwarded to nginx → 200 | The whitelisted method/path. The happy path. |
-| `POST / -> 403` | AGC happily forwarded → **Cilium L7 proxy rejected** before nginx | Same port, same path, different verb. **A vanilla L4 NetworkPolicy could not block this.** |
-| `PUT / -> 403` | Same as POST | Default-deny on methods. Only GET is whitelisted. |
-| `DELETE / -> 403` | Same as POST | Same. |
-| `GET /products -> 404` | Cilium **passed the request** (allowed by `GET /products` rule) → nginx had no such file → returned 404 | **THE KEY MOMENT.** 404 (not 403) means the request reached the app. Proves Cilium is actually doing L7 inspection, not blanket-blocking. |
-| `GET /admin -> 403` | Cilium dropped (path not whitelisted); nginx never saw the request | The bouncer at the door rejected it. nginx never knew it was coming. |
+| Line | Who decided | What happened | Why it matters |
+|---|---|---|---|
+| `GET / -> 200` | nginx | AGC routed → ACNS allowed (`GET /` in whitelist) → nginx served the page | The happy path. Customers' actual users see this. |
+| `POST / -> 403` | **ACNS** | AGC routed → **ACNS rejected the method** → nginx never saw it | Same port as GET. Vanilla L4 NetworkPolicy could not block this. |
+| `PUT / -> 403` | **ACNS** | Same as POST | Default-deny on methods. Only GET is whitelisted. |
+| `DELETE / -> 403` | **ACNS** | Same as POST | A compromised AGC route can't delete data on the pod. |
+| `GET /products -> 404` | **nginx** | AGC routed → ACNS *allowed* (`/products` in whitelist) → nginx had no such file → returned 404 | **The proof point.** 404 means the request reached the app. ACNS is doing real L7 inspection, not blanket-blocking. |
+| `GET /admin -> 403` | **ACNS** | AGC routed → **ACNS rejected the path** → nginx never saw `/admin` | The bouncer at the door rejected it. nginx never knew it was coming. |
 
-**The 404-vs-403 distinction is the single most important slide of the talk.** Anyone can build "deny everything." Proving you can build "deny-all-except-this-method-on-this-path-and-pass-everything-else-untouched" is the AGC + ACNS L7 differentiator vs. classic ingress + L4 NetworkPolicy.
+**The 403-vs-404 distinction is the headline of this demo.** Anyone can build "deny everything." Proving you can build *"allow this method on this path, deny that method on that path, and pass the rest untouched all the way to the app"* — with the responses coming from different layers depending on the rule — is the unique value of AGC + ACNS L7.
 
-### 4c. East-west L7
+> **Verdict:** AGC brought traffic in (every request reached AGC and was forwarded — same port, same destination). ACNS denied four and allowed three, based on the actual HTTP method and path, with the 403s synthesized by Cilium and the 200/404 served by nginx.
+
+**The takeaway to repeat to the customer:** *"AGC delivered all seven requests — same destination, same port. ACNS decided which four to drop and which three to forward. AGC owns *getting traffic in*. ACNS owns *deciding what gets to flow*. That's the division of labor across the entire stack."*
+
+### 4c. ACNS L7 east-west — same enforcement, no AGC involved
 
 | Tests | Layer | What's enforcing | Direction |
 |---|---|---|---|
 | **4c** client → contoso GET/POST, client → fabrikam | **ACNS L7** (east-west, no AGC involved) | Same `CiliumNetworkPolicy` L7 rules, applied to in-cluster pod-to-pod | **East-west: pod ↔ pod** |
 
-**This is the "get creative" bonus — and it's the *east-west* half of the framing.** Same Cilium L7 enforcement as 4b, but the source isn't AGC anymore. **There is no AGC in this picture at all.** One pod inside the cluster (`client`) is talking directly to another pod (`contoso`, `fabrikam`) over the cluster's internal network. ACNS L7 is enforcing on a path AGC never sees.
+**The story in one line:** The same Cilium L7 rules that protected the pod from AGC traffic in 4b also protect it from *other pods* in the cluster — even though AGC isn't anywhere on this path.
 
-**The ACNS framing for this test:** *"AGC controls the front door of the building. ACNS controls every interior door. Even if a pod is already inside the cluster — even if it's been compromised and is now the *source* of malicious traffic — ACNS still enforces the same method-and-path rules. There is no 'trusted east-west' in a zero-trust posture, and ACNS is what makes that real. This is the half of the traffic graph AGC was never designed to touch."*
+**AGC's role here:** **none.** Zero. AGC is not in the data path for any of these three tests. The `client` pod is calling the `contoso` Service directly via cluster DNS (`http://contoso:8080`). This is internal traffic AGC will never see — and that's precisely the point: AGC by itself can't help you with east-west security.
+
+**ACNS's role here:** **everything, again.** And this is the half of the network AGC was never designed to touch. ACNS L7 enforces with the same precision (method, path, source identity) regardless of whether the source is the internet or another pod.
+
+**Talking points** (read out loud while typing the command):
+
+- "In 4b, the source was AGC. In 4c, the source is another pod *inside* the cluster. AGC is not involved at all. We're testing whether ACNS still enforces."
+- "This matters because the most dangerous attack pattern in Kubernetes is *lateral movement*: an attacker compromises one pod — maybe via a vulnerable dependency, maybe a stolen token — and then pivots to richer pods inside the cluster. AGC, by definition, can't see this traffic."
+- "Three calls. Watch the response codes carefully — they tell you three different stories."
+- "`client → contoso GET → 200`: both ends agree this is allowed. `client-may-call-contoso-get-only` lets the client *send* a GET to contoso; `allow-agc-l7-get-only` lets contoso *receive* a GET from anywhere inside the cluster. **Both policies must permit it — they're additive whitelists.**"
+- "`client → contoso POST → 403`: same destination, wrong method. Cilium's L7 proxy parsed the HTTP, saw POST, returned 403. A compromised `client` cannot escalate to writing data on contoso."
+- "`client → fabrikam → 000`: this is different. **No policy whitelists `client → fabrikam` at all.** Default-deny kicks in *at L4* before any HTTP exchange happens. Cilium drops the SYN packet. curl prints `000` because it never received a response."
+- "**403 vs 000 is itself a teaching moment.** 403 means Cilium let you *open the connection* and *send the request*, then explicitly rejected. 000 means Cilium never let the TCP handshake complete. Different layer, same result: denied. Customers can use this distinction in alerting — a 403 is a misbehaving caller you know about; a 000 is an attempt from a peer that should have no business reaching this pod at all."
+- "This is what 'zero-trust east-west' actually looks like in practice. Not just 'mTLS between sidecars' — but pod-level identity, method-level enforcement, default-deny everywhere."
 
 ```bash
 CLIENT=$(kubectl get pod -n $APP_NAMESPACE -l app=client -o jsonpath='{.items[0].metadata.name}')
@@ -599,23 +661,36 @@ client->fabrikam     -> 000
 
 **What it proves:**
 
-| Line | What happened | Why |
-|---|---|---|
-| `client->contoso GET -> 200` | Both `client-may-call-contoso-get-only` and `allow-agc-l7-get-only` permit GET → request reached nginx | **Both ends must agree.** Egress policy on client + ingress policy on contoso both whitelist this exact call. |
-| `client->contoso POST -> 403` | Cilium L7 proxy parsed the HTTP, saw POST, returned 403 | Right pod, right port, **wrong method.** A compromised neighbor cannot call dangerous methods even on services it would otherwise reach. |
-| `client->fabrikam -> 000` | TCP handshake never completed — Cilium silently dropped the SYN | **No policy whitelists `client → fabrikam`.** Default-deny kicks in at L3/L4, before HTTP exists. curl reports `000` for "never got a response." |
+| Line | Who decided | What happened | What it tells the audience |
+|---|---|---|---|
+| `client->contoso GET -> 200` | nginx | Both `client-may-call-contoso-get-only` (egress on client) AND `allow-agc-l7-get-only` (ingress on contoso) permitted GET → nginx served | **Both ends must agree.** Cilium is enforcing identity-based, bidirectional whitelists. |
+| `client->contoso POST -> 403` | **ACNS** | Cilium L7 proxy parsed HTTP, saw POST, synthesized 403 | Right pod, right port, **wrong method.** A compromised neighbor cannot escalate to dangerous methods even on services it can already reach. |
+| `client->fabrikam -> 000` | **ACNS at L4** | TCP handshake never completed — Cilium silently dropped the SYN | **No policy whitelists `client → fabrikam`.** Default-deny kicks in *before HTTP exists*. From the attacker's perspective, fabrikam might as well not exist. |
 
-**Talking point:** *"403 vs 000 is itself a signal. 403 means Cilium spoke HTTP back to us — it accepted the connection, parsed the request, then rejected at L7. 000 means Cilium never even let the TCP handshake complete. Different layer, same result: denied. Customers can use this distinction in their alerting to tell the difference between a misbehaving app (403) and a totally unknown peer (000)."*
+> **Verdict:** AGC is not in this picture. ACNS allowed the one whitelisted call, denied the wrong-method call at L7 with a 403, and denied the unknown-peer call at L4 with a silent drop.
 
-### 4d. Default-deny egress
+**The takeaway to repeat to the customer:** *"AGC controls the front door of the building. ACNS controls every interior door. Even when an attacker is already inside the cluster — even when the attacker is the *source* of malicious traffic — ACNS still enforces the exact same method-and-path rules. There is no 'trusted east-west' in zero-trust, and ACNS is what makes that real. AGC was never designed to touch this half of the traffic graph; ACNS is what completes the story."*
+
+### 4d. ACNS default-deny egress — stopping pods from calling out
 
 | Tests | Layer | What's enforcing | Direction |
 |---|---|---|---|
 | **4d** Backend pod → bing.com | **ACNS** default-deny egress | `default-deny-all` CNP at the pod | East-west out: pod → internet |
 
-**Proves the outbound half of step 4.** A backend pod tries to reach the public internet (`bing.com`). It can't — `default-deny-all` drops outbound traffic, and we never wrote an allow rule for the internet.
+**The story in one line:** A backend pod tries to reach the public internet. ACNS silently drops the connection. A compromised pod can't exfiltrate data, can't phone home, can't pull a second-stage payload.
 
-The ask said *"For outbound, you could allow the controller endpoints and block everything else"* — that's exactly this pattern. We allow DNS in `allow-dns-egress` and nothing else. To allow specific FQDNs (e.g., a vendor API), you'd add another CNP with `toFQDNs: [matchName: "api.vendor.com"]`.
+**AGC's role here:** **none.** This is outbound traffic from a pod. AGC is an *ingress* product — it does not handle pod egress. If you only had AGC and no ACNS, this `wget` to bing.com would succeed.
+
+**ACNS's role here:** **everything.** `default-deny-all` made the contoso pod refuse to send traffic anywhere. `allow-dns-egress` carved out the one exception we wanted (DNS). The *internet* is not in any allow list, so the TCP connection to bing's IP gets silently dropped at the eBPF datapath — the pod's process sees a hung connection and an eventual timeout.
+
+**Talking points** (read out loud while typing the command):
+
+- "This is the inverse of 4b/4c. So far we've been controlling traffic *coming in* to pods. Now we're controlling traffic *going out* from pods."
+- "Why does this matter? Almost every modern attack on Kubernetes ends with the compromised pod calling out — either to exfiltrate data, or to download a second-stage payload, or to phone home to a C2 server. If you cut off egress, you break the attack chain."
+- "The customer ask explicitly said *'allow only the controller endpoints, deny everything else'* — that's exactly the pattern we're enforcing here. We allow DNS, and nothing else by default. Specific outbound destinations would be added with `toFQDNs: [matchName: 'api.vendor.com']` rules."
+- "Notice we're using `bing.com` as the test target. The pod will resolve that to a real Microsoft IP — DNS works because we allowed it. But the actual TCP connection to that IP just hangs. That's the silent-drop signature."
+- "There's no 'connection refused.' There's no ICMP unreachable. From the attacker's perspective, the network is a black hole — they can't even tell whether the destination is unreachable or whether they're being firewalled. That ambiguity is itself a defense."
+- "After 5 seconds wget gives up; we print the exit code. **Non-zero is what we want.** rc=1 means wget failed; the pod could not reach the internet."
 
 ```bash
 CONTOSO=$(kubectl get pod -n $APP_NAMESPACE -l app=contoso -o jsonpath='{.items[0].metadata.name}')
@@ -633,19 +708,35 @@ rc=1  (non-zero = blocked)
 
 **What it proves:**
 
-- **DNS still resolves.** `getaddrinfo("www.bing.com")` succeeds — kube-dns is reached via `allow-dns-egress`, returns a real public IP. So this isn't "the cluster is broken."
-- **The TCP connection to that IP silently times out.** Cilium drops the SYN at the kernel level — no RST, no ICMP unreachable, no useful error. After 5s, wget gives up. This is Cilium's documented default-deny behavior ([silent drop](https://docs.cilium.io/en/latest/security/policy/intro/#policy-deny-response-handling)).
-- **`rc=1`** confirms the application would see this as a failure. **If a workload were exfiltrating data, this is what stops it.** The attacker doesn't even get a useful error code to retry against.
+- **DNS still resolves.** `getaddrinfo("www.bing.com")` succeeded — kube-dns was reached via `allow-dns-egress`. So this isn't "the cluster is broken," it's "the cluster is locked down with a DNS carve-out."
+- **The TCP connection to bing's IP silently times out.** Cilium drops the SYN at the kernel level — no RST, no ICMP unreachable, no useful error. After 5s wget gives up. This is Cilium's documented default-deny behavior ([silent drop](https://docs.cilium.io/en/latest/security/policy/intro/#policy-deny-response-handling)).
+- **`rc=1`** is the application-visible result. **If a workload were exfiltrating data, this is what stops it.** The attacker doesn't even get a useful error code to retry against.
+- **AGC is not in this picture.** AGC is irrelevant to outbound pod traffic. ACNS owns this dimension entirely.
 
-**Talking point:** *"DNS works because we explicitly allowed it. The TCP connection to bing's actual IP just hangs forever. There's no listener missing, there's no firewall returning 'connection refused' — Cilium silently absorbs the packet at the eBPF datapath. From the attacker's perspective, the network is a black hole."*
+> **Verdict:** AGC not involved (this is outbound). ACNS denied the TCP connection silently at the eBPF datapath because no egress allow rule whitelists the public internet.
 
-### 4e. DNS still works
+**The takeaway to repeat to the customer:** *"AGC handles inbound. ACNS handles inbound *and* outbound. With four `CiliumNetworkPolicy` objects we've built default-deny in both directions plus surgical carve-outs for DNS, AGC ingress, and one specific east-west call. A compromised pod can't talk to the internet, can't move laterally, and can't send the wrong HTTP method to its allowed neighbors. That's a complete zero-trust posture, end to end."*
+
+### 4e. ACNS DNS carve-out — proving the lockdown is *precise*, not blunt
 
 | Tests | Layer | What's enforcing | Direction |
 |---|---|---|---|
 | **4e** DNS still resolves | **ACNS** carve-out | `allow-dns-egress` CNP | East-west to kube-dns |
 
-**Proves the carve-out is correctly scoped.** Even with default-deny in place, kube-dns is reachable because `allow-dns-egress` whitelists port 53 to the kube-dns endpoints with the L7 DNS rule `matchPattern: "*"` (any name allowed). **This is the litmus test that you blocked the right things and not too much.**
+**The story in one line:** Default-deny doesn't mean "break the cluster." Workloads can still resolve service names because we explicitly allowed exactly that traffic — nothing more, nothing less.
+
+**AGC's role here:** **none.** Pure pod-to-kube-dns traffic. AGC isn't on this path.
+
+**ACNS's role here:** **the carve-out.** `allow-dns-egress` permits UDP/TCP 53 to pods labeled `k8s-app=kube-dns` in `kube-system`, with an L7 DNS rule that allows any name pattern. This is what makes default-deny survivable.
+
+**Talking points** (read out loud while typing the command):
+
+- "4d showed default-deny working. 4e shows that we didn't just 'unplug the network' — we built a *precise* allow list that keeps the apps functional."
+- "The allow list has exactly one entry for egress that matters here: DNS to kube-dns. That's it. Yet the cluster keeps working because that one carve-out is the right one."
+- "Watch this nslookup return a real IP. That tells you (a) the pod can reach kube-dns on port 53 and (b) Cilium parsed the DNS query at L7 and matched it against the `matchPattern: '*'` rule."
+- "Compare with 4d, which was the same pod calling bing.com. DNS resolved — because we allowed DNS uniformly. But the *TCP connection* failed — because we didn't allow internet egress. Same pod, same Cilium policies, two different outcomes for two different network operations. **That precision is the demo.**"
+- "If a customer wants stricter DNS — say, only resolve names ending in `*.contoso.com` — that's a one-line YAML change: replace `matchPattern: '*'` with `matchPattern: '*.contoso.com'`. Cilium will let those queries through and silently drop everything else, *including the queries themselves*, not just the eventual TCP connections."
+- "This is the difference between 'we have policy' (an audit checkbox) and 'we can demonstrate policy is enforcing surgically' (a production posture)."
 
 ```bash
 kubectl exec -n $APP_NAMESPACE $CLIENT -- nslookup contoso.agc-sites.svc.cluster.local
@@ -666,9 +757,11 @@ Address: 10.0.37.14
 
 - **`Server: 10.0.0.10:53`** — that's the kube-dns ClusterIP. The client pod successfully reached it on port 53. Egress to *that* destination, on *that* port, with the *DNS protocol*, was permitted by `allow-dns-egress`.
 - **`Address: 10.0.37.14`** — the resolved Service IP for contoso. A real DNS answer, not a timeout, not NXDOMAIN.
-- **Compare with 4d.** Same pod resolved `www.bing.com` (DNS allowed) but couldn't connect to it (TCP denied). DNS is uniformly allowed (by name pattern `*`), but **TCP/UDP to anywhere except kube-dns:53** is dropped. That's the precision the ask demanded.
+- **Compare with 4d.** Same pod resolved `www.bing.com` (DNS allowed) but couldn't connect to it (TCP denied). DNS is uniformly allowed (by name pattern `*`), but **TCP/UDP to anywhere except kube-dns:53** is dropped. That's the precision the customer ask demanded.
 
-**Talking point:** *"We didn't break workloads' ability to discover services. We only blocked the actual data path. That's the difference between 'lock it all down and break the app' and 'lock it all down and the app keeps working for the things you allowed.' And if a customer wants per-name DNS allowlisting — `matchPattern: '*.contoso.com'` instead of `*` — that's one YAML line away."*
+> **Verdict:** AGC not involved. ACNS allowed this one specific call (port 53 to kube-dns endpoints) because it's the carve-out we explicitly wrote.
+
+**The takeaway to repeat to the customer:** *"We didn't break workloads' ability to discover services. We only blocked the actual data path to destinations that aren't on our allow list. That's the difference between 'lock it all down and break the app' and 'lock it all down and the app keeps working for the things you allowed.' And every one of those allow rules can be tightened further — down to specific FQDNs, methods, paths — with a one-line YAML change."*
 
 ---
 
@@ -678,7 +771,19 @@ Address: 10.0.37.14
 |---|---|---|---|
 | **5** Live drop monitor | **ACNS** observability | `cilium monitor` reading kernel events | Whichever direction you generate traffic in |
 
-**Optional but a crowd pleaser.** Cilium emits a kernel event for every packet it drops. ACNS exposes that via `cilium monitor`. Tail it in one window, generate a denied request from another, and watch the event scroll by in real time — including the HTTP method that triggered the drop. Makes the abstract "L7 policy" concrete: there's an actual byte-level decision happening on the data plane.
+**The story in one line:** Watch ACNS's enforcement happen in real time. Every drop in step 4 produced a kernel event; this is how you see those events live.
+
+**AGC's role here:** **none.** Observability of in-cluster traffic is an ACNS-side capability.
+
+**ACNS's role here:** **everything.** `cilium monitor` is reading the eBPF event ring buffer on the agent that hosts the target pod. Every L7 verdict (allow / deny / proxy redirect) and every L4 drop produces an event with full identity and HTTP context.
+
+**Talking points** (read out loud while you generate traffic in tab 2):
+
+- "This is the same enforcement layer you saw in 4b–4e. Now you're watching it from the kernel's perspective in real time."
+- "It's eBPF, in-kernel, identity-based. The event isn't 'IP X talked to IP Y' — it's 'identity *client* in namespace *agc-sites* tried to POST to identity *contoso*, verdict DENIED.'"
+- "This is the same data stream that feeds Hubble, Container Insights, and Azure Monitor for AKS. You're seeing the source of truth."
+- "Customers love this for two reasons: (1) it makes 'L7 policy' tangible — they can see real HTTP method strings — and (2) it proves the enforcement is happening at the dataplane, not in some cloud-side log aggregator that runs minutes behind."
+- "Operationally, this is also how you'd debug a misbehaving allow rule: tail the monitor, generate the request, see exactly which rule made the decision."
 
 In one Cloud Shell tab:
 
